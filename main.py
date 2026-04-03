@@ -83,7 +83,7 @@ def check_seceda_tickets():
         with urllib.request.urlopen(req, context=ctx) as response:
             res_data = json.loads(response.read().decode('utf-8'))
             for day in res_data:
-                if day.get("ValidFrom") == f"{TARGET_DATE}T00:00:00":
+                if day.get("ValidFrom", "").startswith(TARGET_DATE):
                     slots = day.get("TimeSlotInfo", [])
                     if slots:
                         capacity = slots[0].get("AvailableSlots", 0)
