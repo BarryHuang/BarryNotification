@@ -149,13 +149,28 @@ def check_parking_zans():
         with urllib.request.urlopen(req, context=ctx) as response:
             res = json.loads(response.read().decode('utf-8'))
 
+        # Debug: show top-level keys in response
+        print(f"[DEBUG] Parking API response keys: {list(res.keys())}")
+
         # The HTML is in domContent under the container ID key
         dom_key = "#lts-wc-id-monitor"
-        html = res.get("domContent", {}).get(dom_key, "")
+        dom_content = res.get("domContent", {})
+        print(f"[DEBUG] domContent keys: {list(dom_content.keys())}")
+        html = dom_content.get(dom_key, "")
 
         if not html:
             print("Parking API: No HTML content in response.")
             return None
+
+        print(f"[DEBUG] HTML length: {len(html)} chars")
+
+        # Debug: find the snippet around the target date
+        date_idx = html.find(PARKING_TARGET_DATE)
+        if date_idx == -1:
+            print(f"[DEBUG] Target date '{PARKING_TARGET_DATE}' not found in HTML.")
+            print(f"[DEBUG] HTML preview (first 500 chars): {html[:500]}")
+        else:
+            print(f"[DEBUG] Found target date at index {date_idx}. Snippet: {html[date_idx:date_idx+300]}")
 
         # Parse the target date entry from the HTML
         # Pattern: data-date="2026-07-21" ... Available tickets: 10+ (or Sold out / Expired)
@@ -175,6 +190,8 @@ def check_parking_zans():
                 return {"status": "Sold Out", "available": "0"}
             elif "Expired" in matched_text:
                 return {"status": "Expired", "available": "0"}
+        else:
+            print(f"[DEBUG] Regex did not match. Pattern was: {pattern}")
 
         return {"status": "Date Not Found", "available": "N/A"}
 
