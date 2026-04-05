@@ -2,17 +2,24 @@
 import os
 import datetime
 import json
+import re
 import urllib.request
 import urllib.parse
 import ssl
 
-TARGET_DATE = "2026-07-20"
+# === Config ===
+SECEDA_TARGET_DATE = "2026-07-20"
+PARKING_TARGET_DATE = "2026-07-21"
+
 LINE_CLIENT_ID = os.environ.get("LINE_CLIENT_ID")
 LINE_CLIENT_SECRET = os.environ.get("LINE_CLIENT_SECRET")
 
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
+
+
+# === LINE Messaging ===
 
 def get_line_token():
     if not LINE_CLIENT_ID or not LINE_CLIENT_SECRET:
@@ -33,6 +40,7 @@ def get_line_token():
     except Exception as e:
         print(f"Failed to get LINE token: {e}")
         return None
+
 
 def send_line_broadcast(token, text):
     url = "https://api.line.me/v2/bot/message/broadcast"
@@ -55,9 +63,12 @@ def send_line_broadcast(token, text):
     except Exception as e:
         print(f"Failed to send LINE message: {e}")
 
+
+# === Seceda Cable Car Ticket Monitor ===
+
 def check_seceda_tickets():
     url = "https://seceda.axess.shop/api/TicketsV4TimeSlotApi/GetReservationTimeSlotsForCalendar"
-    
+
     payload = {
         "ProjNr": "1161",
         "ProductGroupIdentifier": "850",
@@ -83,7 +94,7 @@ def check_seceda_tickets():
         with urllib.request.urlopen(req, context=ctx) as response:
             res_data = json.loads(response.read().decode('utf-8'))
             for day in res_data:
-                if day.get("ValidFrom", "").startswith(TARGET_DATE):
+                if day.get("ValidFrom", "").startswith(SECEDA_TARGET_DATE):
                     slots = day.get("TimeSlotInfo", [])
                     if slots:
                         capacity = slots[0].get("AvailableSlots", 0)
@@ -91,37 +102,142 @@ def check_seceda_tickets():
                     else:
                         return {"status": "Sold Out", "capacity": 0}
             return {"status": "Date Not Found", "capacity": 0}
-            
+
     except Exception as e:
-        print(f"API Error: {e}")
+        print(f"Seceda API Error: {e}")
         return None
 
+
+# === Parking Zans (Odles Dolomites) Monitor ===
+
+def check_parking_zans():
+    """
+    Check parking availability at Parking Zans (Val di Funes / Villnöss)
+    via the LTS Shop Widget API at apps.lts.it.
+
+    The API returns HTML containing date entries with availability info.
+    We parse the HTML to extract the target date's status.
+    """
+    url = "https://apps.lts.it/cart/lts-widget/parse-request"
+
+    # Determine the month start for the query
+    target_month_start = PARKING_TARGET_DATE[:8] + "01"  # e.g. "2026-07-01"
+
+    params = {
+        "data[data][posid]": "B5DA4AD9952440B6A4B54351CFC5A328",
+        "data[data][eventid]": "BBF4CDE820A14B16A5EA28AB3FCF697F",
+        "data[data][language]": "en",
+        "data[data][from]": target_month_start,
+        "data[data][scrolltovariants]": "true",
+        "data[data][maincolor]": "#513c28",
+        "data[referrer]": "www.odlesdolomites.com",
+        "data[main_container_id]": "lts-wc-id-monitor",
+        "url": "site/index"
+    }
+
+    data = urllib.parse.urlencode(params).encode('utf-8')
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Origin": "https://www.odlesdolomites.com",
+        "Referer": "https://www.odlesdolomites.com/"
+    }
+
+    req = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(req, context=ctx) as response:
+            res = json.loads(response.read().decode('utf-8'))
+
+        # The HTML is in domContent under the container ID key
+        dom_key = "#lts-wc-id-monitor"
+        html = res.get("domContent", {}).get(dom_key, "")
+
+        if not html:
+            print("Parking API: No HTML content in response.")
+            return None
+
+        # Parse the target date entry from the HTML
+        # Pattern: data-date="2026-07-21" ... Available tickets: 10+ (or Sold out / Expired)
+        pattern = (
+            rf'data-date="{re.escape(PARKING_TARGET_DATE)}"'
+            r'.*?(?:Available tickets:\s*(\d+\+?)|Sold out|Expired)'
+        )
+        match = re.search(pattern, html, re.DOTALL)
+
+        if match:
+            available_str = match.group(1)
+            matched_text = match.group(0)
+
+            if available_str:
+                return {"status": "Available", "available": available_str}
+            elif "Sold out" in matched_text:
+                return {"status": "Sold Out", "available": "0"}
+            elif "Expired" in matched_text:
+                return {"status": "Expired", "available": "0"}
+
+        return {"status": "Date Not Found", "available": "N/A"}
+
+    except Exception as e:
+        print(f"Parking API Error: {e}")
+        return None
+
+
+# === Main ===
+
 def main():
-    result = check_seceda_tickets()
     today = datetime.datetime.now().strftime("%Y-%m-%d %H:%M UTC")
-    
-    if result:
-        status_text = f"總剩餘票證容量：{result['capacity']} 張\\n開放狀態：{result['status']}"
+
+    # --- Seceda cable car ---
+    seceda_result = check_seceda_tickets()
+    if seceda_result:
+        seceda_text = (
+            f"總剩餘票證容量：{seceda_result['capacity']} 張\n"
+            f"開放狀態：{seceda_result['status']}"
+        )
     else:
-        status_text = "目前取得資料失敗，請以網頁實際狀況為主或稍後再試。"
-        
+        seceda_text = "⚠️ 取得資料失敗，請以網頁實際狀況為主。"
+
+    # --- Parking Zans ---
+    parking_result = check_parking_zans()
+    if parking_result:
+        parking_text = (
+            f"可預約車位：{parking_result['available']}\n"
+            f"開放狀態：{parking_result['status']}"
+        )
+    else:
+        parking_text = "⚠️ 取得資料失敗，請以網頁實際狀況為主。"
+
+    # --- Compose notification ---
     body = (
-        f"📅 報告時間：{today}\\n"
-        f"🚠 Seceda 纜車 {TARGET_DATE} 單程票監控 (來自 GitHub Actions)\\n\\n"
-        f"【當日總量狀態】\\n"
-        f"{status_text}\\n\\n"
-        f"🔗 預約網址：https://seceda.axess.shop/en/Products/Tickets/Calendar/1161/850/4351\\n"
-        f"🤖 此為自動化播報服務"
+        f"📅 報告時間：{today}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"\n"
+        f"🚠 Seceda 纜車 {SECEDA_TARGET_DATE} 單程票\n"
+        f"【當日總量狀態】\n"
+        f"{seceda_text}\n"
+        f"🔗 https://seceda.axess.shop/en/Products/Tickets/Calendar/1161/850/4351\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"\n"
+        f"🅿️ Parking Zans 停車位 {PARKING_TARGET_DATE}\n"
+        f"【當日預約狀態】\n"
+        f"{parking_text}\n"
+        f"🔗 https://www.odlesdolomites.com/en/events/BBF4CDE820A14B16A5EA28AB3FCF697F\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 此為自動化播報服務 (GitHub Actions)"
     )
-    
+
     print("Execution result:")
-    print(body.replace('\\n', '\n'))
-    
+    print(body)
+
     line_token = get_line_token()
     if line_token:
-        send_line_broadcast(line_token, body.replace('\\n', '\n'))
+        send_line_broadcast(line_token, body)
     else:
         print("Skipping LINE broadcast as tokens are not configured.")
+
 
 if __name__ == "__main__":
     main()
