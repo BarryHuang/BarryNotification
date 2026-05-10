@@ -5,7 +5,9 @@ on:
     # GitHub Actions 排程通常延遲 2~3 小時，設定 UTC 22:00 (台灣 06:00) 補償延遲，預計台灣 08:00~09:00 收到通知
     - cron: '0 22 * * *'
   workflow_dispatch: # 允許您在網頁上手動點擊執行測試
-
+  push:
+    branches:
+      - main
 jobs:
   check-tickets:
     runs-on: ubuntu-latest
