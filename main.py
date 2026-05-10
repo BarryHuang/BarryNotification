@@ -209,7 +209,7 @@ def main():
     seceda_result = check_seceda_tickets()
     if seceda_result:
         seceda_text = (
-            f"總剩餘票證容量：{seceda_result['capacity']} 張\n"
+            f"總剫)��票證容量：{seceda_result['capacity']} 張\n"
             f"開放狀態：{seceda_result['status']}"
         )
     else:
