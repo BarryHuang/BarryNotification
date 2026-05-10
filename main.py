@@ -178,7 +178,7 @@ def check_parking_zans():
             rf'data-date="{re.escape(PARKING_TARGET_DATE)}"'
             r'.*?(?:Available tickets:\s*(\d+\+?)|Sold out|Expired)'
         )
-        match = re.search(pattern, html, re.DOTALL)
+        match = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
 
         if match:
             available_str = match.group(1)
@@ -186,9 +186,9 @@ def check_parking_zans():
 
             if available_str:
                 return {"status": "Available", "available": available_str}
-            elif "Sold out" in matched_text:
+            elif re.search(r'sold out', matched_text, re.IGNORECASE):
                 return {"status": "Sold Out", "available": "0"}
-            elif "Expired" in matched_text:
+            elif re.search(r'expired', matched_text, re.IGNORECASE):
                 return {"status": "Expired", "available": "0"}
         else:
             print(f"[DEBUG] Regex did not match. Pattern was: {pattern}")
