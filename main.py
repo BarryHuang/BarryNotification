@@ -229,9 +229,9 @@ def check_konigssee_tickets(date_str):
             if not fahrplan:
                 return {"status": "No Schedule", "total_frei": 0}
             
-            # 只要 08:15 的班次
-            target_time = "0815"
-            total_frei = sum(f.get("frei", 0) for f in fahrplan if f.get("frei", 0) > 0 and f.get("abfahrt_uhrzeit") == target_time)
+            # 只要 08:15 和 08:30 的班次
+            target_times = ["0815", "0830"]
+            total_frei = sum(f.get("frei", 0) for f in fahrplan if f.get("frei", 0) > 0 and f.get("abfahrt_uhrzeit") in target_times)
             status = "Available" if total_frei > 0 else "Sold Out"
             return {"status": status, "total_frei": total_frei}
     except Exception as e:
@@ -294,7 +294,7 @@ def main():
         f"━━━━━━━━━━━━━━━━━━\n"
         f"\n"
         f"⛴️ Königssee 國王湖船票 (Seelände -> Salet)\n"
-        f"【各日期 08:15 班次剩餘票數】\n"
+        f"【各日期 08:15 / 08:30 班次剩餘票數】\n"
         f"{konigssee_text}\n"
         f"🔗 https://shop-ks.seenschifffahrt.de/?lang=en\n"
         f"\n"
