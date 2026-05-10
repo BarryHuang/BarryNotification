@@ -10,6 +10,7 @@ import ssl
 # === Config ===
 SECEDA_TARGET_DATE = "2026-07-20"
 PARKING_TARGET_DATE = "2026-07-21"
+KONIGSSEE_TARGET_DATES = ["2026-07-01", "2026-07-08", "2026-07-15", "2026-07-22", "2026-07-29"]
 
 LINE_CLIENT_ID = os.environ.get("LINE_CLIENT_ID")
 LINE_CLIENT_SECRET = os.environ.get("LINE_CLIENT_SECRET")
@@ -200,6 +201,42 @@ def check_parking_zans():
         return None
 
 
+# === Königssee Ticket Monitor ===
+
+def check_konigssee_tickets(date_str):
+    url = "https://shop-ks.seenschifffahrt.de/ajax/onlinereservierungv4.php"
+    payload = {
+        "aktion": "fahrplan_load",
+        "datum": date_str,
+        "station_start": "1",  # Seelände
+        "station_stop": "3",   # Salet (Full route)
+        "lang": "en"
+    }
+    data = urllib.parse.urlencode(payload).encode('utf-8')
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    req = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(req, context=ctx) as response:
+            res = json.loads(response.read().decode('utf-8'))
+            if not res.get("success"):
+                return {"status": "Error", "total_frei": 0}
+            
+            fahrplan = res.get("fahrplan", [])
+            if not fahrplan:
+                return {"status": "No Schedule", "total_frei": 0}
+            
+            total_frei = sum(f.get("frei", 0) for f in fahrplan if f.get("frei", 0) > 0)
+            status = "Available" if total_frei > 0 else "Sold Out"
+            return {"status": status, "total_frei": total_frei}
+    except Exception as e:
+        print(f"Königssee API Error for {date_str}: {e}")
+        return None
+
+
 # === Main ===
 
 def main():
@@ -225,6 +262,16 @@ def main():
     else:
         parking_text = "⚠️ 取得資料失敗，請以網頁實際狀況為主。"
 
+    # --- Königssee ---
+    konigssee_text_lines = []
+    for d in KONIGSSEE_TARGET_DATES:
+        res = check_konigssee_tickets(d)
+        if res:
+            konigssee_text_lines.append(f"  - {d}: {res['status']} (剩餘 {res['total_frei']} 張)")
+        else:
+            konigssee_text_lines.append(f"  - {d}: ⚠️ 取得資料失敗")
+    konigssee_text = "\n".join(konigssee_text_lines)
+
     # --- Compose notification ---
     body = (
         f"📅 報告時間：{today}\n"
@@ -241,6 +288,13 @@ def main():
         f"【當日預約狀態】\n"
         f"{parking_text}\n"
         f"🔗 https://www.odlesdolomites.com/en/events/BBF4CDE820A14B16A5EA28AB3FCF697F\n"
+        f"\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"\n"
+        f"⛴️ Königssee 國王湖船票 (Seelände -> Salet)\n"
+        f"【各日期剩餘總票數】\n"
+        f"{konigssee_text}\n"
+        f"🔗 https://shop-ks.seenschifffahrt.de/?lang=en\n"
         f"\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🤖 此為自動化播報服務 (GitHub Actions)"
