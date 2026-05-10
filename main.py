@@ -229,11 +229,20 @@ def check_konigssee_tickets(date_str):
             if not fahrplan:
                 return {"status": "No Schedule", "total_frei": 0}
             
-            # 只要 08:15 和 08:30 的班次
-            target_times = ["0815", "0830"]
-            total_frei = sum(f.get("frei", 0) for f in fahrplan if f.get("frei", 0) > 0 and f.get("abfahrt_uhrzeit") in target_times)
+            # 分別統計 08:15 和 08:30 的班次
+            target_times = {"0815": "08:15", "0830": "08:30"}
+            slots = {v: 0 for v in target_times.values()}
+            
+            for f in fahrplan:
+                uhrzeit = f.get("abfahrt_uhrzeit")
+                if uhrzeit in target_times:
+                    frei = f.get("frei", 0)
+                    if frei > 0:
+                        slots[target_times[uhrzeit]] += frei
+
+            total_frei = sum(slots.values())
             status = "Available" if total_frei > 0 else "Sold Out"
-            return {"status": status, "total_frei": total_frei}
+            return {"status": status, "slots": slots}
     except Exception as e:
         print(f"Königssee API Error for {date_str}: {e}")
         return None
@@ -269,7 +278,8 @@ def main():
     for d in KONIGSSEE_TARGET_DATES:
         res = check_konigssee_tickets(d)
         if res:
-            konigssee_text_lines.append(f"  - {d}: {res['status']} (剩餘 {res['total_frei']} 張)")
+            slots_text = " / ".join([f"{time}剩{count}張" for time, count in res['slots'].items()])
+            konigssee_text_lines.append(f"  - {d}: {res['status']} ({slots_text})")
         else:
             konigssee_text_lines.append(f"  - {d}: ⚠️ 取得資料失敗")
     konigssee_text = "\n".join(konigssee_text_lines)
@@ -294,7 +304,7 @@ def main():
         f"━━━━━━━━━━━━━━━━━━\n"
         f"\n"
         f"⛴️ Königssee 國王湖船票 (Seelände -> Salet)\n"
-        f"【各日期 08:15 / 08:30 班次剩餘票數】\n"
+        f"【各日期 08:15 / 08:30 班次狀況】\n"
         f"{konigssee_text}\n"
         f"🔗 https://shop-ks.seenschifffahrt.de/?lang=en\n"
         f"\n"
