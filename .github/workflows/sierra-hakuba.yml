@@ -1,0 +1,30 @@
+name: Sierra Hakuba Booking Monitor
+
+on:
+  schedule:
+    # GitHub Actions 排程通常延遲 2~3 小時，設定 UTC 22:00 (台灣 06:00) 補償延遲，預計台灣 08:00~09:00 收到通知
+    - cron: '0 22 * * *'
+  workflow_dispatch: # 允許您在網頁上手動點擊執行測試
+jobs:
+  check-booking:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Run script
+        env:
+          LINE_CLIENT_ID: ${{ secrets.LINE_CLIENT_ID }}
+          LINE_CLIENT_SECRET: ${{ secrets.LINE_CLIENT_SECRET }}
+        run: |
+          python sierra_hakuba.py
