@@ -1,4 +1,4 @@
-name: Sierra Hakuba Booking Monitor
+name: Hakuba Booking Monitor (Sierra + Courtyard)
 
 on:
   schedule:
