@@ -229,8 +229,8 @@ def check_konigssee_tickets(date_str):
             if not fahrplan:
                 return {"status": "No Schedule", "total_frei": 0}
             
-            # 分別統計 08:15 和 08:30 的班次
-            target_times = {"0815": "08:15", "0830": "08:30"}
+            # 分別統計 08:15、08:30 和 09:00 的班次
+            target_times = {"0815": "08:15", "0830": "08:30", "0900": "09:00"}
             slots = {v: 0 for v in target_times.values()}
             
             for f in fahrplan:
