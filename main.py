@@ -275,11 +275,17 @@ def main():
 
     # --- Königssee ---
     konigssee_text_lines = []
+    today_date = datetime.date.today()
     for d in KONIGSSEE_TARGET_DATES:
+        # 自動略過已過期的日期
+        if datetime.datetime.strptime(d, "%Y-%m-%d").date() < today_date:
+            continue
         res = check_konigssee_tickets(d)
-        if res:
+        if res and 'slots' in res:
             slots_text = " / ".join([f"{time}剩{count}張" for time, count in res['slots'].items()])
             konigssee_text_lines.append(f"  - {d}: {res['status']} ({slots_text})")
+        elif res:
+            konigssee_text_lines.append(f"  - {d}: {res['status']}")
         else:
             konigssee_text_lines.append(f"  - {d}: ⚠️ 取得資料失敗")
     konigssee_text = "\n".join(konigssee_text_lines)
