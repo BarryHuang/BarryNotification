@@ -238,6 +238,8 @@ NAME_SEASONS = int(os.environ.get("NAME_SEASONS", "24"))   # 對建案名稱用�
 OUT_DIR = os.path.join(HERE, "docs")
 DATA_DIR = os.path.join(OUT_DIR, "data")
 STATE_PATH = os.path.join(DATA_DIR, "seen.json")
+HISTORY_PATH = os.path.join(DATA_DIR, "history.json")
+HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "60"))
 SITE_URL = os.environ.get("SITE_URL", "https://barryhuang.github.io/BarryNotification/")
 
 
@@ -325,7 +327,95 @@ def project_name(idx, region, road, built):
     return (cands[0] if len(cands) == 1 else None), cands
 
 
-def render(resale, presale, skipped, seasons, name_idx=None):
+def spark(vals, w=88, h=24):
+    if len(vals) < 2:
+        return ""
+    lo, hi = min(vals), max(vals)
+    rng = (hi - lo) or 1
+    step = w / (len(vals) - 1)
+    pts = ["%.1f,%.1f" % (i * step, h - 2 - (v - lo) / rng * (h - 4)) for i, v in enumerate(vals)]
+    return ('<svg class="spark" viewBox="0 0 %d %d" preserveAspectRatio="none" aria-hidden="true">'
+            '<polyline points="%s"/><circle cx="%.1f" cy="%s" r="2"/></svg>'
+            % (w, h, " ".join(pts), w, pts[-1].split(",")[1]))
+
+
+def build_overview(resale, seasons):
+    rows = []
+    for region, cfg in REGIONS.items():
+        priced = [d for d in resale if d["區域"] == region and d["單價萬每坪"]
+                  and any(t in d["型態"] for t in RESIDENTIAL)]
+        if not priced:
+            continue
+        ps = sorted(d["單價萬每坪"] for d in priced)
+        byq = collections.defaultdict(list)
+        for d in priced:
+            byq[d["季別"]].append(d["單價萬每坪"])
+        qs = [med(byq[q]) for q in seasons if len(byq.get(q, [])) >= 3]
+        delta = ""
+        if len(qs) >= 2:
+            diff = qs[-1] - qs[-2]
+            cls = "up" if diff > 0 else ("down" if diff < 0 else "flat")
+            delta = '<span class="delta %s">%s%.1f</span>' % (cls, "+" if diff > 0 else "", diff)
+        rows.append(
+            '<a class="ov-card" href="#%s"><h3>%s</h3><p class="ov-note">%s</p>'
+            '<p class="ov-price"><b>%.1f</b><span>萬/坪中位</span></p>'
+            '<p class="ov-sub">中間五成 %.0f–%.0f · %d 筆 · 屋齡≤%d年</p>'
+            '<p class="ov-trend">%s<span class="ov-q">最新一季 %s</span>%s</p></a>'
+            % (esc(region), esc(region), esc(cfg.get("note", "")), med(ps),
+               ps[len(ps)//4], ps[len(ps)*3//4], len(priced), cfg["max_age"],
+               spark(qs), ("%.1f" % qs[-1]) if qs else "—", delta))
+    return '<section class="overview"><h2 class="sec-title">四區總覽</h2><div class="ov-grid">%s</div></section>' % "".join(rows)
+
+
+def build_daily(history):
+    if not history:
+        return ""
+    items = []
+    for h in sorted(history, key=lambda x: x["日期"], reverse=True)[:30]:
+        n_r, n_p = h.get("新成交總數", 0), h.get("新預售總數", 0)
+        if h.get("基準"):
+            body = '<p class="day-none">建立比對基準，未列新成交。</p>'
+            badge = '<span class="badge base">基準</span>'
+        elif not (n_r or n_p):
+            body = '<p class="day-none">實價登錄當日無新揭露。</p>'
+            badge = '<span class="badge quiet">無新增</span>'
+        else:
+            # 同一個建案的整批登錄收成一列，避免被單一社區洗版
+            g = collections.defaultdict(list)
+            for d in h.get("新成交", []) + h.get("新預售", []):
+                g[(d["區"], d["名"], bool(d.get("預售")))].append(d)
+            groups = sorted(g.items(), key=lambda kv: max(x["日"] or "" for x in kv[1]), reverse=True)
+            lis = []
+            for (region, name, is_pre), v in groups[:12]:
+                ups = sorted(x["單"] for x in v if x.get("單"))
+                up = ("%.0f–%.0f 萬/坪" % (ups[0], ups[-1])) if len(ups) > 1 else (
+                    ("%.1f 萬/坪" % ups[0]) if ups else "—")
+                sizes = sorted(x["坪"] for x in v if x.get("坪"))
+                size = ("%.0f–%.0f坪" % (sizes[0], sizes[-1])) if len(sizes) > 1 else (
+                    ("%s坪" % sizes[0]) if sizes else "")
+                cnt = ('<i class="cnt">×%d</i>' % len(v)) if len(v) > 1 else ""
+                lis.append('<li><span class="d-date">%s</span>'
+                           '<span class="d-name">%s%s%s</span>'
+                           '<span class="d-meta">%s · %s</span></li>'
+                           % (esc((max(x["日"] or "" for x in v))[2:]),
+                              '<i class="pre">預售</i>' if is_pre else "",
+                              esc("%s｜%s" % (region, name)), cnt, esc(size), up))
+            more = ('<li class="more">…另 %d 個建案</li>' % (len(groups) - 12)) if len(groups) > 12 else ""
+            body = '<ul class="day-list">%s%s</ul>' % ("".join(lis), more)
+            badge = '<span class="badge new">新增 %d 筆</span>' % (n_r + n_p)
+        chips = "".join('<span class="chip">%s <b>%.1f</b></span>' % (esc(k), v["中位"])
+                        for k, v in h.get("各區", {}).items())
+        items.append('<details class="day"%s><summary><span class="day-date">%s</span>%s'
+                     '<span class="chips">%s</span></summary>%s</details>'
+                     % (" open" if h is sorted(history, key=lambda x: x["日期"], reverse=True)[0] else "",
+                        esc(h["日期"]), badge, chips, body))
+    return ('<section class="daily" id="每日更新"><h2 class="sec-title">每日更新紀錄</h2>'
+            '<p class="sec-note">每天自動抓一次實價登錄，記下當天新揭露的成交與各區中位單價。'
+            '實價登錄每月 1、11、21 日揭露，因此多數日子會是「無新增」。</p>%s</section>'
+            % "".join(items))
+
+
+def render(resale, presale, skipped, seasons, name_idx=None, history=None):
     name_idx = name_idx if name_idx is not None else {}
     parts = []
     for region, cfg in REGIONS.items():
@@ -461,9 +551,11 @@ def render(resale, presale, skipped, seasons, name_idx=None):
 
     nav = "".join('<a href="#%s">%s</a>' % (esc(r), esc(r))
                   for r in REGIONS if any(d["區域"] == r for d in resale))
+    nav = '<a href="#每日更新">每日更新</a>' + nav
     tmpl = open(os.path.join(HERE, "hsinchu_template.html"), encoding="utf-8").read()
     updated = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
     values = dict(nav=nav, body="".join(parts), total=len(resale), skipped=skipped,
+                  overview=build_overview(resale, seasons), daily=build_daily(history or []),
                   span="%s – %s" % (season_label(seasons[0]), season_label(seasons[-1])),
                   lo=int(LO), hi=int(HI), updated=updated)
     for k, v in values.items():
@@ -497,6 +589,49 @@ def save_seen(ids):
                    "ids": sorted(ids)}, f, ensure_ascii=False, indent=0)
 
 
+def load_history():
+    try:
+        with open(HISTORY_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_history(history):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+        json.dump(history[-HISTORY_DAYS:], f, ensure_ascii=False, indent=1)
+
+
+def compact(d, presale=False):
+    return {"日": d["成交日"], "區": d["區域"],
+            "名": (d["建案名稱"] if presale else d["社區棟別"]) or "—",
+            "坪": d["坪數"], "總": d["總價萬"], "單": d["單價萬每坪"] or None,
+            "預售": presale}
+
+
+def update_history(resale, new_resale, new_presale, baseline):
+    """每天記一筆：各區中位單價 + 當天新揭露的成交。同一天重跑會覆蓋。"""
+    today = datetime.date.today().isoformat()
+    regions = {}
+    for region in REGIONS:
+        ps = sorted(d["單價萬每坪"] for d in resale
+                    if d["區域"] == region and d["單價萬每坪"]
+                    and any(t in d["型態"] for t in RESIDENTIAL))
+        if ps:
+            regions[region] = {"中位": med(ps), "筆數": len(ps)}
+    entry = {"日期": today, "基準": bool(baseline), "各區": regions,
+             "新成交": [] if baseline else [compact(d) for d in new_resale[:40]],
+             "新預售": [] if baseline else [compact(d, True) for d in new_presale[:20]],
+             "新成交總數": 0 if baseline else len(new_resale),
+             "新預售總數": 0 if baseline else len(new_presale)}
+    history = [h for h in load_history() if h.get("日期") != today]
+    history.append(entry)
+    history.sort(key=lambda h: h["日期"])
+    save_history(history)
+    return history
+
+
 def get_line_token():
     cid, secret = os.environ.get("LINE_CLIENT_ID"), os.environ.get("LINE_CLIENT_SECRET")
     if not cid or not secret:
@@ -526,45 +661,72 @@ def send_line_broadcast(token, text):
         print("Failed to send LINE message: %s" % e)
 
 
-def build_message(new_resale, new_presale):
+def region_summary(resale):
+    """各區中位單價 / 筆數，做為每日固定摘要。"""
+    lines = []
+    for region, cfg in REGIONS.items():
+        ps = sorted(d["單價萬每坪"] for d in resale
+                    if d["區域"] == region and d["單價萬每坪"]
+                    and any(t in d["型態"] for t in RESIDENTIAL))
+        if not ps:
+            continue
+        lines.append("· %s %.1f萬/坪（%d筆・屋齡≤%d年）"
+                     % (region, med(ps), len(ps), cfg["max_age"]))
+    return lines
+
+
+def build_message(new_resale, new_presale, resale, baseline=False):
     def group(rows, key):
         g = collections.defaultdict(list)
         for d in rows:
             g[(d["區域"], key(d))].append(d)
-        # 依該建案最新成交日排序
         return collections.OrderedDict(
             sorted(g.items(), key=lambda kv: max(x["成交日"] for x in kv[1]), reverse=True))
 
-    lines = ["🏠 新竹房價報表更新", ""]
-    if new_resale:
-        lines.append("【新成交 %d 筆】" % len(new_resale))
-        g = group(new_resale, lambda d: d["社區棟別"])
-        for (region, name), v in list(g.items())[:10]:
-            ups = sorted(x["單價萬每坪"] for x in v if x["單價萬每坪"])
-            price = ("%.0f–%.0f萬/坪" % (ups[0], ups[-1])) if len(ups) > 1 else (
-                ("%.1f萬/坪" % ups[0]) if ups else "—")
-            sizes = sorted(x["坪數"] for x in v if x["坪數"])
-            size = ("%.0f–%.0f坪" % (sizes[0], sizes[-1])) if len(sizes) > 1 else (
-                ("%.0f坪" % sizes[0]) if sizes else "")
-            n = ("×%d筆 " % len(v)) if len(v) > 1 else ""
-            lines.append("· %s %s｜%s %s%s %s"
-                         % (max(x["成交日"] for x in v)[2:].replace("-", "/"), region, name, n, size, price))
-        if len(g) > 10:
-            lines.append("· …另 %d 個建案" % (len(g) - 10))
+    def price_range(v):
+        ups = sorted(x["單價萬每坪"] for x in v if x["單價萬每坪"])
+        if len(ups) > 1:
+            return "%.0f–%.0f萬/坪" % (ups[0], ups[-1])
+        return ("%.1f萬/坪" % ups[0]) if ups else "—"
+
+    lines = ["🏠 新竹房價報表 %s" % datetime.date.today().strftime("%m/%d"), ""]
+
+    if baseline:
+        lines.append("（首次建立比對基準，未列新成交）")
         lines.append("")
-    if new_presale:
-        lines.append("【新預售 %d 筆】" % len(new_presale))
-        g = group(new_presale, lambda d: d["建案名稱"] or "未命名")
-        for (region, name), v in list(g.items())[:8]:
-            ups = sorted(x["單價萬每坪"] for x in v if x["單價萬每坪"])
-            price = ("%.0f–%.0f萬/坪" % (ups[0], ups[-1])) if len(ups) > 1 else (
-                ("%.1f萬/坪" % ups[0]) if ups else "—")
-            n = ("×%d筆 " % len(v)) if len(v) > 1 else ""
-            lines.append("· %s %s｜%s %s%s"
-                         % (max(x["成交日"] for x in v)[2:].replace("-", "/"), region, name, n, price))
-        if len(g) > 8:
-            lines.append("· …另 %d 個建案" % (len(g) - 8))
+    elif new_resale or new_presale:
+        if new_resale:
+            lines.append("【新成交 %d 筆】" % len(new_resale))
+            g = group(new_resale, lambda d: d["社區棟別"])
+            for (region, name), v in list(g.items())[:10]:
+                sizes = sorted(x["坪數"] for x in v if x["坪數"])
+                size = ("%.0f–%.0f坪" % (sizes[0], sizes[-1])) if len(sizes) > 1 else (
+                    ("%.0f坪" % sizes[0]) if sizes else "")
+                n = ("×%d筆 " % len(v)) if len(v) > 1 else ""
+                lines.append("· %s %s｜%s %s%s %s"
+                             % (max(x["成交日"] for x in v)[2:].replace("-", "/"),
+                                region, name, n, size, price_range(v)))
+            if len(g) > 10:
+                lines.append("· …另 %d 個建案" % (len(g) - 10))
+            lines.append("")
+        if new_presale:
+            lines.append("【新預售 %d 筆】" % len(new_presale))
+            g = group(new_presale, lambda d: d["建案名稱"] or "未命名")
+            for (region, name), v in list(g.items())[:8]:
+                n = ("×%d筆 " % len(v)) if len(v) > 1 else ""
+                lines.append("· %s %s｜%s %s%s"
+                             % (max(x["成交日"] for x in v)[2:].replace("-", "/"),
+                                region, name, n, price_range(v)))
+            if len(g) > 8:
+                lines.append("· …另 %d 個建案" % (len(g) - 8))
+            lines.append("")
+    else:
+        lines.append("今日無新成交揭露。")
         lines.append("")
+
+    lines.append("【各區中位單價】")
+    lines += region_summary(resale)
+    lines.append("")
     lines.append("完整報表 " + SITE_URL)
     return "\n".join(lines)
 
@@ -580,12 +742,10 @@ def main():
     presale = collect_presale(seasons)
     # 預售登錄早於完工數年，取更長的期間才對得到建案名稱
     name_idx = build_name_index(collect_presale(recent_seasons(NAME_SEASONS)))
-    render(resale, presale, skipped, seasons, name_idx)
-    write_csv(resale, "hsinchu_resale.csv")
-    write_csv(presale, "hsinchu_presale.csv")
     print("成屋 %d 筆、預售 %d 筆（另 %d 筆缺完工年月）" % (len(resale), len(presale), skipped))
 
     seen = load_seen()
+    baseline = first_run or not seen
     new_resale = [d for d in resale if d["編號"] and d["編號"] not in seen]
     new_presale = [d for d in presale if d["編號"] and d["編號"] not in seen]
     new_resale.sort(key=lambda d: d["成交日"] or "", reverse=True)
@@ -593,13 +753,13 @@ def main():
     # 只保留目前季別窗內的編號，狀態檔才不會無限膨脹
     save_seen({d["編號"] for d in resale + presale if d["編號"]})
 
-    if not seen or first_run:
-        print("首次建立比對基準，跳過通知（%d 筆納入基準）" % len(new_resale + new_presale))
-        return
-    if not (new_resale or new_presale):
-        print("沒有新成交，不發通知。")
-        return
-    msg = build_message(new_resale, new_presale)
+    history = update_history(resale, new_resale, new_presale, baseline)
+    render(resale, presale, skipped, seasons, name_idx, history)
+    write_csv(resale, "hsinchu_resale.csv")
+    write_csv(presale, "hsinchu_presale.csv")
+
+    # 不論有沒有新成交都發通知
+    msg = build_message(new_resale, new_presale, resale, baseline)
     print(msg)
     if notify:
         token = get_line_token()

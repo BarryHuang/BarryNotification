@@ -48,6 +48,60 @@ nav.jump a{
 nav.jump a:hover,nav.jump a:focus-visible{border-color:var(--accent); color:var(--accent)}
 :focus-visible{outline:2px solid var(--accent); outline-offset:2px}
 
+/* ── 總覽 ── */
+.sec-title{font-size:clamp(19px,2.6vw,24px)}
+.sec-note{margin:0; max-width:70ch; color:var(--muted); font-size:13.5px}
+.overview,.daily{display:flex; flex-direction:column; gap:16px}
+.ov-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px}
+.ov-card{
+  display:flex; flex-direction:column; gap:3px; text-decoration:none; color:inherit;
+  background:var(--surface); border:1px solid var(--line); border-radius:12px;
+  padding:15px 17px 13px; box-shadow:var(--shadow); transition:border-color .15s, transform .15s;
+}
+.ov-card:hover,.ov-card:focus-visible{border-color:var(--accent); transform:translateY(-1px)}
+.ov-card h3{font-size:17px}
+.ov-note{margin:0; font-size:12px; color:var(--muted); min-height:1.4em}
+.ov-price{margin:8px 0 0; display:flex; align-items:baseline; gap:6px}
+.ov-price b{font-family:"IBM Plex Mono",monospace; font-size:29px; font-weight:600; letter-spacing:-.02em}
+.ov-price span{font-size:12px; color:var(--muted)}
+.ov-sub{margin:0; font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums}
+.ov-trend{margin:10px 0 0; display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--muted)}
+.ov-q{font-family:"IBM Plex Mono",monospace}
+svg.spark{width:88px; height:24px; flex:none}
+svg.spark polyline{fill:none; stroke:var(--accent); stroke-width:1.5; vector-effect:non-scaling-stroke}
+svg.spark circle{fill:var(--accent)}
+.delta{font-family:"IBM Plex Mono",monospace; font-weight:600}
+.delta.up{color:var(--warm)} .delta.down{color:var(--accent)} .delta.flat{color:var(--muted)}
+
+/* ── 每日更新 ── */
+.day{background:var(--surface); border:1px solid var(--line); border-radius:10px; overflow:hidden}
+.day+.day{margin-top:8px}
+.day summary{
+  display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; cursor:pointer;
+  padding:11px 15px; list-style:none; font-size:13.5px;
+}
+.day summary::-webkit-details-marker{display:none}
+.day summary::before{content:"▸"; color:var(--muted); font-size:11px; transition:transform .15s}
+.day[open] summary::before{transform:rotate(90deg)}
+.day[open] summary{border-bottom:1px solid var(--line-2)}
+.day-date{font-family:"IBM Plex Mono",monospace; font-weight:600}
+.badge{font-size:11px; border-radius:999px; padding:2px 9px; border:1px solid var(--line)}
+.badge.new{background:var(--accent-soft); border-color:var(--accent-2); color:var(--accent); font-weight:600}
+.badge.quiet{color:var(--muted)}
+.badge.base{color:var(--muted); border-style:dashed}
+.chips{margin-left:auto; display:flex; flex-wrap:wrap; gap:4px 10px; font-size:11.5px; color:var(--muted)}
+.chip b{font-family:"IBM Plex Mono",monospace; color:var(--ink-2)}
+.day-none{margin:0; padding:13px 15px; font-size:13px; color:var(--muted)}
+.day-list{margin:0; padding:8px 15px 13px; list-style:none; display:flex; flex-direction:column; gap:6px}
+.day-list li{display:flex; flex-wrap:wrap; align-items:baseline; gap:4px 10px; font-size:13px}
+.d-date{font-family:"IBM Plex Mono",monospace; color:var(--muted); font-size:12px; min-width:62px}
+.d-name{font-weight:500}
+.d-meta{color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; margin-left:auto}
+.pre{font-style:normal; font-size:10.5px; color:var(--accent); border:1px solid var(--accent-2);
+  border-radius:4px; padding:0 4px; margin-right:5px}
+.cnt{font-style:normal; font-size:11px; color:var(--muted); margin-left:6px}
+.day-list .more{color:var(--muted); font-size:12px}
+
 /* ── region ── */
 .region{display:flex; flex-direction:column; gap:22px; scroll-margin-top:20px}
 .region-head{display:flex; flex-direction:column; gap:18px}
@@ -188,6 +242,10 @@ code{font-family:"IBM Plex Mono",monospace; font-size:.92em; background:var(--su
   </div>
   <nav class="jump">{{nav}}</nav>
 </header>
+
+{{overview}}
+
+{{daily}}
 
 {{body}}
 
