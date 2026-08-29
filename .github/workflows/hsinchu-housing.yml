@@ -1,0 +1,51 @@
+name: Hsinchu Housing Report
+
+on:
+  schedule:
+    # 台灣時間每天約 07:00 起跑（GitHub 排程常延遲 1~2 小時）
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: '重建比對基準（不發 LINE 通知）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hsinchu-housing
+  cancel-in-progress: false
+
+jobs:
+  build-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build report and notify
+        env:
+          LINE_CLIENT_ID: ${{ secrets.LINE_CLIENT_ID }}
+          LINE_CLIENT_SECRET: ${{ secrets.LINE_CLIENT_SECRET }}
+          SITE_URL: https://barryhuang.github.io/BarryNotification/
+        run: |
+          python hsinchu_housing.py ${{ inputs.seed && '--seed' || '' }}
+
+      - name: Commit updated report
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs
+          if git diff --cached --quiet; then
+            echo "報表無變動，不需 commit。"
+          else
+            git commit -m "更新新竹房價報表 $(date -u +'%Y-%m-%d')"
+            git push
+          fi

@@ -1,0 +1,201 @@
+<title>新竹房價帶</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+TC:wght@400;500;700&family=Noto+Serif+TC:wght@600;700&display=swap">
+<style>
+:root{
+  --bg:#F1F4F6; --surface:#FFFFFF; --surface-2:#F7FAFB;
+  --ink:#132330; --ink-2:#3B4E5C; --muted:#657886; --line:#D8E1E7; --line-2:#E9EFF3;
+  --accent:#0F6B84; --accent-2:#7FB8C7; --accent-soft:#D6E8ED;
+  --warm:#B35C2A; --shadow:0 1px 2px rgba(19,35,48,.06), 0 8px 24px -18px rgba(19,35,48,.35);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0B131A; --surface:#131F28; --surface-2:#182731;
+    --ink:#E1ECF2; --ink-2:#C0D0DA; --muted:#8CA0AE; --line:#233440; --line-2:#1B2A34;
+    --accent:#5FBCD6; --accent-2:#2E6C80; --accent-soft:#153039;
+    --warm:#DE9260; --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -20px rgba(0,0,0,.9);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0B131A; --surface:#131F28; --surface-2:#182731;
+  --ink:#E1ECF2; --ink-2:#C0D0DA; --muted:#8CA0AE; --line:#233440; --line-2:#1B2A34;
+  --accent:#5FBCD6; --accent-2:#2E6C80; --accent-soft:#153039;
+  --warm:#DE9260; --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px -20px rgba(0,0,0,.9);
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font-family:"Noto Sans TC","PingFang TC","Microsoft JhengHei",system-ui,sans-serif;
+  font-size:15px; line-height:1.65; -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px; margin:0 auto; padding:clamp(28px,5vw,64px) clamp(16px,4vw,40px) 96px; display:flex; flex-direction:column; gap:56px}
+h1,h2,h3,h4{font-family:"Noto Serif TC",Georgia,serif; font-weight:700; text-wrap:balance; margin:0; line-height:1.3}
+.num,.mono,b{font-family:"IBM Plex Mono","Noto Sans TC",monospace; font-variant-numeric:tabular-nums}
+
+/* ── header ── */
+.masthead{display:flex; flex-direction:column; gap:20px; border-bottom:2px solid var(--ink); padding-bottom:22px}
+.eyebrow{font-size:12px; letter-spacing:.22em; text-transform:uppercase; color:var(--accent); font-weight:700; margin:0}
+h1{font-size:clamp(30px,5.4vw,46px); letter-spacing:-.01em}
+.lede{margin:0; max-width:62ch; color:var(--ink-2); font-size:16px}
+.meta{display:flex; flex-wrap:wrap; gap:8px 26px; margin:0; padding:0; list-style:none; font-size:13px; color:var(--muted)}
+.meta b{color:var(--ink); font-weight:600}
+nav.jump{display:flex; flex-wrap:wrap; gap:8px}
+nav.jump a{
+  font-size:13px; text-decoration:none; color:var(--ink-2); background:var(--surface);
+  border:1px solid var(--line); border-radius:999px; padding:5px 14px; transition:.15s;
+}
+nav.jump a:hover,nav.jump a:focus-visible{border-color:var(--accent); color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+
+/* ── region ── */
+.region{display:flex; flex-direction:column; gap:22px; scroll-margin-top:20px}
+.region-head{display:flex; flex-direction:column; gap:18px}
+.region-title h2{font-size:clamp(21px,3vw,27px)}
+.region-title{display:flex; flex-direction:column; gap:3px; border-left:3px solid var(--accent); padding-left:14px}
+.note{margin:0; color:var(--muted); font-size:13.5px}
+.stats{display:grid; grid-template-columns:repeat(auto-fit,minmax(148px,1fr)); gap:1px; margin:0;
+  background:var(--line); border:1px solid var(--line); border-radius:10px; overflow:hidden}
+.stats>div{background:var(--surface); padding:13px 16px; display:flex; flex-direction:column; gap:2px}
+.stats dt{font-size:11.5px; letter-spacing:.09em; color:var(--muted); text-transform:uppercase}
+.stats dd{margin:0; display:flex; align-items:baseline; gap:6px}
+.stats b{font-family:"IBM Plex Mono",monospace; font-size:23px; font-weight:600; color:var(--ink); letter-spacing:-.02em}
+.stats span{font-size:12px; color:var(--muted)}
+
+.trend-wrap{background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:14px 16px 6px; display:flex; flex-direction:column; gap:2px}
+.trend-wrap h3{font-size:12px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); font-family:"Noto Sans TC",sans-serif; font-weight:700}
+svg.trend{width:100%; height:auto; display:block; overflow:visible}
+.tline{fill:none; stroke:var(--accent); stroke-width:1.8; stroke-linejoin:round}
+.tarea{fill:var(--accent-soft); stroke:none}
+.tdot{fill:var(--surface); stroke:var(--accent); stroke-width:1.6}
+.tlab{fill:var(--muted); font-size:9.5px; font-family:"IBM Plex Mono",monospace}
+.tval{fill:var(--ink); font-size:11px; font-weight:600; font-family:"IBM Plex Mono",monospace}
+
+/* ── roads ── */
+.roads{display:flex; flex-direction:column; gap:16px}
+.road{background:var(--surface); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); overflow:hidden}
+.road-head{display:flex; flex-wrap:wrap; align-items:baseline; justify-content:space-between; gap:6px 16px;
+  padding:13px 18px; background:var(--surface-2); border-bottom:1px solid var(--line)}
+.road-head h4{font-size:16.5px}
+.road-meta{margin:0; font-size:13px; color:var(--muted)}
+.road-meta b{color:var(--ink); font-size:15px; font-weight:600}
+.presale .road-head{background:var(--accent-soft); border-bottom-color:var(--accent-2)}
+.recent{border-color:var(--accent-2)}
+.recent .road-head{background:var(--accent-soft); border-bottom-color:var(--accent-2)}
+
+.tw{overflow-x:auto}
+table{width:100%; border-collapse:collapse; font-size:13.5px; min-width:600px}
+thead th{
+  font-family:"Noto Sans TC",sans-serif; font-weight:700; font-size:11px; letter-spacing:.08em;
+  color:var(--muted); text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); white-space:nowrap;
+}
+tbody th{font-weight:500; text-align:left; padding:9px 12px; color:var(--ink); white-space:nowrap}
+tbody td{padding:9px 12px; border-top:1px solid var(--line-2)}
+tbody th{border-top:1px solid var(--line-2)}
+tbody tr:hover td,tbody tr:hover th{background:var(--surface-2)}
+.num{text-align:right; font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums; white-space:nowrap}
+.dim{color:var(--muted)}
+.strong{color:var(--ink); font-weight:600}
+.proj{font-family:"IBM Plex Mono","Noto Sans TC",monospace; font-size:13px}
+.tag{margin-left:7px; font-size:10.5px; color:var(--accent); border:1px solid var(--accent-2);
+  border-radius:4px; padding:1px 5px; vertical-align:1px}
+.rest{margin:0; padding:9px 18px 12px; font-size:12px; color:var(--muted); border-top:1px solid var(--line-2)}
+
+/* ── range bar ── */
+th.range{width:36%}
+td.range{padding:9px 12px}
+.bar{position:relative; display:block; height:16px; width:100%; min-width:170px}
+.bar-track{position:absolute; inset:6px 0 auto 0; height:4px; border-radius:2px;
+  background:
+    linear-gradient(var(--line),var(--line)) 0 0/100% 100% no-repeat;
+}
+.bar-track::after{
+  content:""; position:absolute; inset:-5px 0 -5px 0;
+  background-image:
+    linear-gradient(var(--line-2),var(--line-2)),
+    linear-gradient(var(--line-2),var(--line-2)),
+    linear-gradient(var(--line-2),var(--line-2)),
+    linear-gradient(var(--line-2),var(--line-2));
+  background-size:1px 100%,1px 100%,1px 100%,1px 100%;
+  background-repeat:no-repeat;
+  background-position:11.1% 0,33.3% 0,55.6% 0,77.8% 0;
+}
+.bar-span{position:absolute; top:6px; height:4px; border-radius:2px; background:var(--accent-2)}
+.bar-dot{position:absolute; top:2px; width:11px; height:11px; margin-left:-5.5px; border-radius:50%;
+  background:var(--accent); border:2px solid var(--surface)}
+.axis{display:flex; align-items:center; gap:10px; font-size:11.5px; color:var(--muted); flex-wrap:wrap}
+.axis .rule{position:relative; flex:1 1 220px; height:22px; min-width:200px}
+.axis .rule span{position:absolute; top:0; transform:translateX(-50%); font-family:"IBM Plex Mono",monospace}
+.axis .rule::before{content:""; position:absolute; left:0; right:0; top:17px; height:1px; background:var(--line)}
+.legend{display:flex; align-items:center; gap:16px; flex-wrap:wrap; font-size:12px; color:var(--muted)}
+.legend i{display:inline-block; vertical-align:middle; margin-right:6px}
+.k-span{width:26px; height:4px; border-radius:2px; background:var(--accent-2)}
+.k-dot{width:9px; height:9px; border-radius:50%; background:var(--accent)}
+
+/* ── footer ── */
+footer{border-top:1px solid var(--line); padding-top:22px; display:flex; flex-direction:column; gap:14px}
+footer h3{font-size:15px}
+footer ol{margin:0; padding-left:1.25em; color:var(--ink-2); font-size:13.5px; display:flex; flex-direction:column; gap:7px; max-width:74ch}
+footer a{color:var(--accent)}
+.dl{margin:0; font-size:13.5px; color:var(--muted)}
+.dl a{font-weight:600}
+code{font-family:"IBM Plex Mono",monospace; font-size:.92em; background:var(--surface-2);
+  border:1px solid var(--line); border-radius:4px; padding:1px 5px}
+/* 手機：收掉次要欄位，讓價格帶與中位數留在畫面內 */
+@media (max-width:760px){
+  table{min-width:0; font-size:12.5px}
+  thead th,tbody th,tbody td{padding:8px 9px}
+  .col-built,.col-age,.col-size{display:none}
+  th.range{width:auto}
+  .bar{min-width:96px}
+  .proj{font-size:12px}
+  .tag{display:none}
+}
+@media (max-width:640px){
+  .stats b{font-size:20px}
+  .stats>div{padding:11px 13px}
+  .wrap{gap:44px}
+  .road-head{padding:11px 14px}
+}
+@media (prefers-reduced-motion:reduce){ *{transition:none!important; animation:none!important} }
+</style>
+
+<div class="wrap">
+<header class="masthead">
+  <p class="eyebrow">實價登錄開放資料 · 建案級拆解</p>
+  <h1>新竹四大重劃區的房價帶</h1>
+  <p class="lede">把內政部實價登錄的原始成交檔，按高鐵特區、光埔、關埔、公道五沿線四個區塊拆到「路段 → 建案」層級。每一列的橫條是那個建案的實際成交單價分布，所有橫條共用同一條價格軸，可以直接橫向比較。</p>
+  <ul class="meta">
+    <li>期間 <b>{{span}}</b></li>
+    <li>成交 <b>{{total}}</b> 筆</li>
+    <li>單位 <b>萬元/坪</b></li>
+    <li>來源 <b>內政部不動產成交案件實際資訊資料供應系統</b></li>
+    <li>更新 <b>{{updated}}</b></li>
+  </ul>
+  <div class="axis">
+    <span>價格軸</span>
+    <span class="rule"><span style="left:0%">{{lo}}</span><span style="left:11.1%">40</span><span style="left:33.3%">60</span><span style="left:55.6%">80</span><span style="left:77.8%">100</span><span style="left:100%">{{hi}}</span></span>
+  </div>
+  <div class="legend">
+    <span><i class="k-span"></i>最低–最高成交單價</span>
+    <span><i class="k-dot"></i>中位數</span>
+    <span>建案＝同路段＋同建築完工年月的門牌群</span>
+  </div>
+  <nav class="jump">{{nav}}</nav>
+</header>
+
+{{body}}
+
+<footer>
+  <h3>原始明細</h3>
+  <p class="dl"><a href="hsinchu_resale.csv" download>成屋成交明細 CSV</a> · <a href="hsinchu_presale.csv" download>預售成交明細 CSV</a>　每日隨報表一起更新。</p>
+  <h3>怎麼算的，以及不能怎麼用</h3>
+  <ol>
+    <li><b>建案是推估的。</b>成屋買賣檔沒有社區名稱欄位，只有門牌。這裡把「同一路段＋同一建築完工年月」的門牌歸為同一個建案，並顯示門牌範圍與棟數。預售屋檔才有登錄的真實建案名稱，另列一區。</li>
+    <li><b>屋齡以成交當下計算</b>（成交年月 − 建築完成年月）。高鐵特區出現大量屋齡近 0 的整批登錄，是建商第一次移轉的新成屋；原始資料的負值已在此頁歸零顯示。</li>
+    <li><b>單價統計只採計住宅大樓與華廈</b>，排除透天、店面、廠辦與純車位交易。極端低價多為親友間交易或含特殊約定，明細 CSV 的備註欄可逐筆查證。</li>
+    <li><b>區塊邊界是人為劃的。</b>光埔與關埔在地理上重疊，這裡把慈雲路、埔頂各路歸光埔（好市多一帶），關新路、介壽路歸關埔；公道五慈雲路口的社區多半登錄為慈雲路門牌，因此計入光埔區。要調整改腳本裡的 <code>REGIONS</code> 即可。</li>
+    <li><b>最新一季尚未揭露完整。</b>實價登錄申報後約 30 天才揭露，季檔會隨時間補齊，末季的筆數與中位數不宜單獨解讀為行情轉折。另有 {{skipped}} 筆因缺建築完成年月而排除。</li>
+  </ol>
+</footer>
+</div>
