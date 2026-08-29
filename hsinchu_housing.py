@@ -83,12 +83,25 @@ def fetch(code, season, kind):
     return [r for r in rows if r.get("鄉鎮市區") and not r["鄉鎮市區"].startswith("The villages")]
 
 
+ROAD_RE = re.compile(r"^(?:新竹[縣市])?(?:[^市鄉鎮區]{1,3}[市鄉鎮區])?(?:新竹市)?"
+                     r"(.*?[路街道](?:[東西南北]?[一二三四五六七八九十]段)?)"
+                     r"(?=[０-９0-9]|巷|弄|號|之|$)")
+
+
+def road_of(addr):
+    """從門牌抽出完整路名（含段），抽不出來時退回原字串前段。"""
+    m = ROAD_RE.match(addr)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    return re.sub(r"^(?:新竹[縣市])?(?:[^市鄉鎮區]{1,3}[市鄉鎮區])?", "", addr)[:12]
+
+
 def classify(addr):
-    """回傳 (區域, 路段) 或 (None, None)。"""
+    """回傳 (區域, 路段) 或 (None, None)；路段用門牌實際路名，不是比對用的關鍵字。"""
     for region, cfg in REGIONS.items():
-        for road in sorted(cfg["roads"], key=len, reverse=True):
-            if road in addr:
-                return region, road
+        for kw in sorted(cfg["roads"], key=len, reverse=True):
+            if kw in addr:
+                return region, road_of(addr)
     return None, None
 
 
@@ -221,6 +234,7 @@ def write_csv(rows, name):
 # =====================================================================
 
 NUM_SEASONS = int(os.environ.get("NUM_SEASONS", "10"))
+NAME_SEASONS = int(os.environ.get("NAME_SEASONS", "24"))   # 對建案名稱用的預售資料期間
 OUT_DIR = os.path.join(HERE, "docs")
 DATA_DIR = os.path.join(OUT_DIR, "data")
 STATE_PATH = os.path.join(DATA_DIR, "seen.json")
@@ -283,7 +297,36 @@ def trend_svg(points):
 
 
 
-def render(resale, presale, skipped, seasons):
+# 預售屋檔有真實建案名稱，成屋檔沒有；用「同區同路段、預售登錄早於完工 0~4.5 年」
+# 把兩邊對起來。只有唯一候選才敢掛名，多個候選則列出候選名單。
+NAME_WINDOW_MONTHS = 54
+
+
+def _ym(d):
+    return int(d[:4]) * 12 + int(d[5:7])
+
+
+def build_name_index(presale_all):
+    idx = collections.defaultdict(lambda: collections.defaultdict(list))
+    for d in presale_all:
+        if d["建案名稱"] and d["成交日"]:
+            idx[(d["區域"], d["路段"])][d["建案名稱"]].append(d["成交日"])
+    return idx
+
+
+def project_name(idx, region, road, built):
+    """回傳 (唯一建案名 or None, 候選名單)。"""
+    if not built:
+        return None, []
+    b = _ym(built)
+    cands = [n for n, ds in idx.get((region, road), {}).items()
+             if any(0 <= b - _ym(d) <= NAME_WINDOW_MONTHS for d in ds)]
+    cands.sort()
+    return (cands[0] if len(cands) == 1 else None), cands
+
+
+def render(resale, presale, skipped, seasons, name_idx=None):
+    name_idx = name_idx if name_idx is not None else {}
     parts = []
     for region, cfg in REGIONS.items():
         rs = [d for d in resale if d["區域"] == region]
@@ -313,14 +356,22 @@ def render(resale, presale, skipped, seasons):
                 rng = addr_range([x["社區棟別"] for x in v])
                 nd = len({x["社區棟別"] for x in v})
                 age = max(med([x["屋齡"] for x in v]), 0)
+                name, cands = project_name(name_idx, region, road, k)
+                if name:
+                    label = '<span class="pname">%s</span><span class="sub">%s</span>' % (esc(name), esc(rng))
+                elif len(cands) > 1:
+                    label = '<span class="proj">%s</span><span class="sub">候選：%s</span>' % (
+                        esc(rng), esc("／".join(cands[:3])))
+                else:
+                    label = '<span class="proj">%s</span>' % esc(rng)
                 sizes = sorted(x["坪數"] for x in v if x["坪數"])
                 rows.append(
-                    '<tr><th scope="row"><span class="proj">%s</span>%s</th>'
+                    '<tr><th scope="row">%s%s</th>'
                     '<td class="num dim col-built">%s</td><td class="num dim col-age">%.0f</td>'
                     '<td class="num dim col-size">%s</td><td class="num">%d</td>'
                     '<td class="range">%s</td><td class="num strong">%.1f</td>'
                     '<td class="num dim">%.0f–%.0f</td></tr>'
-                    % (esc(rng), ('<span class="tag">%d棟</span>' % nd) if nd > 1 else "",
+                    % (label, ('<span class="tag">%d棟</span>' % nd) if nd > 1 else "",
                        esc(k or "—"), age, ("%.0f" % med(sizes)) if sizes else "—",
                        len(v), bar(p[0], med(p), p[-1]), med(p), p[0], p[-1]))
             rest = len(items) - sum(len(v) for _, v in shown)
@@ -362,8 +413,10 @@ def render(resale, presale, skipped, seasons):
         for d in rs:
             groups[(d["路段"], d["完工年月"][:7])].append(d)
         proj_label = {}
-        for k, v in groups.items():
-            proj_label[k] = addr_range([x["社區棟別"] for x in v]) if len(v) > 1 else v[0]["社區棟別"]
+        for (road, built), v in groups.items():
+            rng = addr_range([x["社區棟別"] for x in v]) if len(v) > 1 else v[0]["社區棟別"]
+            name, _ = project_name(name_idx, region, road, built)
+            proj_label[(road, built)] = ("%s（%s）" % (name, rng)) if name else rng
 
         recent = sorted([d for d in rs if d["成交日"]], key=lambda d: d["成交日"], reverse=True)[:RECENT_N]
         rrows = []
@@ -525,7 +578,9 @@ def main():
 
     resale, skipped = collect_resale(seasons)
     presale = collect_presale(seasons)
-    render(resale, presale, skipped, seasons)
+    # 預售登錄早於完工數年，取更長的期間才對得到建案名稱
+    name_idx = build_name_index(collect_presale(recent_seasons(NAME_SEASONS)))
+    render(resale, presale, skipped, seasons, name_idx)
     write_csv(resale, "hsinchu_resale.csv")
     write_csv(presale, "hsinchu_presale.csv")
     print("成屋 %d 筆、預售 %d 筆（另 %d 筆缺完工年月）" % (len(resale), len(presale), skipped))

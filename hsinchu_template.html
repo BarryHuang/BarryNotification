@@ -97,6 +97,7 @@ tbody tr:hover td,tbody tr:hover th{background:var(--surface-2)}
 .dim{color:var(--muted)}
 .strong{color:var(--ink); font-weight:600}
 .proj{font-family:"IBM Plex Mono","Noto Sans TC",monospace; font-size:13px; display:block}
+.pname{display:block; font-weight:700; font-size:13.5px; color:var(--ink)}
 .sub{display:block; font-size:11.5px; color:var(--muted); font-weight:400; margin-top:1px}
 .nowrap{white-space:nowrap}
 .recent tbody th{white-space:normal; min-width:180px}
@@ -195,7 +196,8 @@ code{font-family:"IBM Plex Mono",monospace; font-size:.92em; background:var(--su
   <p class="dl"><a href="hsinchu_resale.csv" download>成屋成交明細 CSV</a> · <a href="hsinchu_presale.csv" download>預售成交明細 CSV</a>　每日隨報表一起更新。</p>
   <h3>怎麼算的，以及不能怎麼用</h3>
   <ol>
-    <li><b>建案是推估的。</b>成屋買賣檔沒有社區名稱欄位，只有門牌。這裡把「同一路段＋同一建築完工年月」的門牌歸為同一個建案，並顯示門牌範圍與棟數。預售屋檔才有登錄的真實建案名稱，另列一區。</li>
+    <li><b>建案是推估的。</b>成屋買賣檔沒有社區名稱欄位，只有門牌。這裡把「同一路段＋同一建築完工年月」的門牌歸為同一個建案，並顯示門牌範圍與棟數。</li>
+    <li><b>建案名稱來自預售屋檔的回推。</b>預售屋檔有登錄的真實建案名稱，把「同區同路段、預售登錄早於完工 0–4.5 年」的建案對上成屋門牌群；只有唯一候選才掛名，多個候選時列出候選名單，其餘只顯示門牌範圍。預售資料自實價登錄 2.0（2021 年）才完整，因此 2021 年以前完工的社區多半對不到名字。</li>
     <li><b>屋齡以成交當下計算</b>（成交年月 − 建築完成年月）。高鐵特區出現大量屋齡近 0 的整批登錄，是建商第一次移轉的新成屋；原始資料的負值已在此頁歸零顯示。</li>
     <li><b>單價統計只採計住宅大樓與華廈</b>，排除透天、店面、廠辦與純車位交易。極端低價多為親友間交易或含特殊約定，明細 CSV 的備註欄可逐筆查證。</li>
     <li><b>區塊邊界是人為劃的。</b>光埔與關埔在地理上重疊，這裡把慈雲路、埔頂各路歸光埔（好市多一帶），關新路、介壽路歸關埔；公道五慈雲路口的社區多半登錄為慈雲路門牌，因此計入光埔區。要調整改腳本裡的 <code>REGIONS</code> 即可。</li>
