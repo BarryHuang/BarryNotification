@@ -357,23 +357,36 @@ def render(resale, presale, skipped, seasons):
                         '</tr></thead><tbody>%s</tbody></table></div></section>'
                         % (len(pre), "".join(rows)))
 
+        # 「社區」以同路段＋同完工年月的門牌群為代理（成屋檔無社區名稱欄位）
+        groups = collections.defaultdict(list)
+        for d in rs:
+            groups[(d["路段"], d["完工年月"][:7])].append(d)
+        proj_label = {}
+        for k, v in groups.items():
+            proj_label[k] = addr_range([x["社區棟別"] for x in v]) if len(v) > 1 else v[0]["社區棟別"]
+
         recent = sorted([d for d in rs if d["成交日"]], key=lambda d: d["成交日"], reverse=True)[:RECENT_N]
         rrows = []
         for d in recent:
             up = ("%.1f" % d["單價萬每坪"]) if d["單價萬每坪"] else "—"
+            proj = proj_label.get((d["路段"], d["完工年月"][:7]), d["社區棟別"])
+            floor = re.sub(r"[，,].*?(?=/|$)", "", d["樓層"] or "").replace("層", "").replace("/", " / ")
             rrows.append(
-                '<tr><td class="num dim">%s</td><th scope="row"><span class="proj">%s</span></th>'
-                '<td class="dim col-built">%s</td><td class="num col-age">%.0f</td>'
+                '<tr><td class="num dim">%s</td>'
+                '<th scope="row"><span class="proj">%s</span>'
+                '<span class="sub">%s · %s</span></th>'
+                '<td class="num">%.0f</td><td class="num nowrap">%s</td>'
                 '<td class="num">%s</td><td class="num">%s</td>'
                 '<td class="num strong">%s</td><td class="dim col-size">%s</td></tr>'
-                % (esc(d["成交日"]), esc(d["社區棟別"]), esc(d["樓層"]), max(d["屋齡"], 0),
-                   esc(d["坪數"]), esc(d["總價萬"]), up, esc(d["格局"])))
+                % (esc((d["成交日"] or "")[2:]), esc(proj), esc(d["社區棟別"]), esc(d["型態"].split("(")[0]),
+                   max(d["屋齡"], 0), esc(floor), esc(d["坪數"]), esc(d["總價萬"]), up, esc(d["格局"])))
         recent_html = (
             '<section class="road recent"><header class="road-head"><h4>最近 %d 筆成交</h4>'
             '<p class="road-meta">依成交日排序 · 含所有建物型態</p></header>'
             '<div class="tw"><table><thead><tr><th scope="col" class="num">成交日</th>'
-            '<th scope="col">門牌</th><th scope="col" class="col-built">樓層</th>'
-            '<th scope="col" class="num col-age">屋齡</th><th scope="col" class="num">坪數</th>'
+            '<th scope="col">社區（門牌範圍）／該筆門牌</th>'
+            '<th scope="col" class="num">屋齡</th><th scope="col" class="num">樓層</th>'
+            '<th scope="col" class="num">坪數</th>'
             '<th scope="col" class="num">總價(萬)</th><th scope="col" class="num">萬/坪</th>'
             '<th scope="col" class="col-size">格局</th></tr></thead><tbody>%s</tbody></table></div></section>'
             % (len(rrows), "".join(rrows))) if rrows else ""

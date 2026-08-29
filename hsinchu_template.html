@@ -96,7 +96,10 @@ tbody tr:hover td,tbody tr:hover th{background:var(--surface-2)}
 .num{text-align:right; font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums; white-space:nowrap}
 .dim{color:var(--muted)}
 .strong{color:var(--ink); font-weight:600}
-.proj{font-family:"IBM Plex Mono","Noto Sans TC",monospace; font-size:13px}
+.proj{font-family:"IBM Plex Mono","Noto Sans TC",monospace; font-size:13px; display:block}
+.sub{display:block; font-size:11.5px; color:var(--muted); font-weight:400; margin-top:1px}
+.nowrap{white-space:nowrap}
+.recent tbody th{white-space:normal; min-width:180px}
 .tag{margin-left:7px; font-size:10.5px; color:var(--accent); border:1px solid var(--accent-2);
   border-radius:4px; padding:1px 5px; vertical-align:1px}
 .rest{margin:0; padding:9px 18px 12px; font-size:12px; color:var(--muted); border-top:1px solid var(--line-2)}
@@ -145,7 +148,8 @@ code{font-family:"IBM Plex Mono",monospace; font-size:.92em; background:var(--su
 @media (max-width:760px){
   table{min-width:0; font-size:12.5px}
   thead th,tbody th,tbody td{padding:8px 9px}
-  .col-built,.col-age,.col-size{display:none}
+  .col-built,.col-size{display:none}
+  .recent tbody th{min-width:150px}
   th.range{width:auto}
   .bar{min-width:96px}
   .proj{font-size:12px}
