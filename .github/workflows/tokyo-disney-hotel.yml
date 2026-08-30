@@ -1,0 +1,36 @@
+name: Tokyo Disney Hotel Monitor (2027/01/30-02/01)
+
+on:
+  schedule:
+    # GitHub Actions 排程通常延遲 2~3 小時，設定 UTC 22:00 (台灣 06:00) 補償延遲，
+    # 預計台灣 08:00~09:00 收到通知。官網開賣時間是台灣 10:00，來得及準備。
+    - cron: '0 22 * * *'
+  workflow_dispatch: # 允許在網頁上手動點擊執行測試
+
+concurrency:
+  group: tokyo-disney-hotel
+  cancel-in-progress: false
+
+jobs:
+  check-booking:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Run script
+        env:
+          LINE_CLIENT_ID: ${{ secrets.LINE_CLIENT_ID }}
+          LINE_CLIENT_SECRET: ${{ secrets.LINE_CLIENT_SECRET }}
+        run: |
+          python tokyo_disney_hotel.py
