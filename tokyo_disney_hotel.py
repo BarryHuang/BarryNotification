@@ -71,7 +71,26 @@ BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
-PAGE_TIMEOUT_MS = 60000
+# 導覽逾時。官網是 JS 動態渲染，實測 networkidle 永遠等不到
+# （30/30 全部 60 秒逾時），所以改成等 DOM 就緒 + 輪詢內容出現。
+PAGE_TIMEOUT_MS = 30000
+
+# DOM 就緒後，最多再等這麼久讓搜尋結果渲染出來
+RESULT_WAIT_MS = 15000
+
+# 頁面出現這些字樣之一，就視為結果已經渲染完成
+READY_MARKERS = (
+    "円", "満室", "空室", "プラン", "予約",
+    "見つかりませんでした", "受け付けておりません",
+)
+
+# 診斷輸出：頁面判讀不出來時，印出前幾筆的實際內容供除錯
+DIAGNOSTIC_SAMPLES = 2
+
+# 連續這麼多筆都讀不到就中止整輪掃描。
+# 官網掛掉或擋我們時，沒必要把剩下幾十個頁面各等滿逾時
+# （那會讓單輪跑掉數十分鐘，甚至超過 workflow 的時間上限）。
+ABORT_AFTER_CONSECUTIVE_FAILURES = 6
 
 LINE_CLIENT_ID = os.environ.get("LINE_CLIENT_ID")
 LINE_CLIENT_SECRET = os.environ.get("LINE_CLIENT_SECRET")
@@ -350,6 +369,48 @@ def extract_prices(text):
     return sorted(set(values))
 
 
+def load_search_page(page, url):
+    """載入搜尋結果頁並回傳頁面文字。
+
+    不使用 wait_until="networkidle"：官網背景有持續的請求，這個條件
+    實際上永遠不會成立（實測整批 60 秒逾時）。改為等 DOM 就緒，
+    再輪詢頁面文字直到出現價格／滿室等關鍵字。
+    """
+    page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+
+    waited = 0
+    text = ""
+    while waited < RESULT_WAIT_MS:
+        try:
+            text = page.inner_text("body")
+        except Exception:
+            text = ""
+        if any(marker in text for marker in READY_MARKERS):
+            return text
+        page.wait_for_timeout(500)
+        waited += 500
+
+    # 等不到關鍵字也把目前的內容交出去，交給 classify_page 判斷
+    return text
+
+
+def describe_page(page, text, label):
+    """把頁面實際長相印進 log，方便在看不到網站的情況下除錯。"""
+    try:
+        title = page.title()
+    except Exception:
+        title = "(取不到標題)"
+    try:
+        url = page.url
+    except Exception:
+        url = "(取不到網址)"
+    snippet = " ".join((text or "").split())[:300]
+    print(f"  [診斷] {label}")
+    print(f"    title: {title}")
+    print(f"    url:   {url}")
+    print(f"    text:  {snippet or '(頁面沒有任何文字)'}")
+
+
 def find_room_names(text):
     """從一段文字裡找出看起來像房型名稱的字串（保持出現順序、去重）。"""
     names = []
@@ -436,6 +497,9 @@ def scan_dates(hotel_codes, dates, staying_days=1, delay_ms=2500):
 
     hotel_names = dict(HOTELS)
     rows = []
+    diagnosed = [0]
+    consecutive_failures = 0
+    aborted = False
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
@@ -445,20 +509,26 @@ def scan_dates(hotel_codes, dates, staying_days=1, delay_ms=2500):
         )
         page = context.new_page()
         for use_date in dates:
+            if aborted:
+                break
             for hotel_cd in hotel_codes:
                 url = build_search_url(hotel_cd, use_date, staying_days)
                 prices, offers = [], []
+                text = ""
                 try:
-                    page.goto(url, wait_until="networkidle", timeout=PAGE_TIMEOUT_MS)
-                    page.wait_for_timeout(2500)
-                    text = page.inner_text("body")
+                    text = load_search_page(page, url)
                     status, _ = classify_page(text)
                     prices = extract_prices(text)
                     if status == "AVAILABLE":
                         offers = extract_offers(page, text)
                 except Exception as e:
                     status = "UNKNOWN"
-                    print(f"  ! {use_date} {hotel_cd} 載入失敗：{e}")
+                    print(f"  ! {use_date} {hotel_cd} 載入失敗："
+                          f"{str(e).splitlines()[0]}")
+
+                if status in ("UNKNOWN", "BLOCKED") and diagnosed[0] < DIAGNOSTIC_SAMPLES:
+                    diagnosed[0] += 1
+                    describe_page(page, text, f"{use_date} {hotel_cd} 判讀為 {status}")
 
                 rows.append({
                     "key": f"{use_date}|{hotel_cd}",
@@ -470,6 +540,11 @@ def scan_dates(hotel_codes, dates, staying_days=1, delay_ms=2500):
                     "offers": offers,
                     "url": url,
                 })
+                if status in ("UNKNOWN", "BLOCKED"):
+                    consecutive_failures += 1
+                else:
+                    consecutive_failures = 0
+
                 cheapest = f"{prices[0]:,} 円起" if prices else "-"
                 rooms = f" [{len(offers)} 種房型]" if offers else ""
                 print(f"  {use_date} ({WEEKDAY_TW[use_date.weekday()]}) {hotel_cd}: "
@@ -477,6 +552,13 @@ def scan_dates(hotel_codes, dates, staying_days=1, delay_ms=2500):
                 for offer in offers:
                     price = f"{offer['price']:,} 円" if offer["price"] else "價格未擷取"
                     print(f"      - {offer['room']}：{price}")
+
+                if consecutive_failures >= ABORT_AFTER_CONSECUTIVE_FAILURES:
+                    print(f"  ⚠️ 連續 {consecutive_failures} 筆讀不到，中止這一輪掃描"
+                          f"（已查 {len(rows)} / {len(dates) * len(hotel_codes)} 筆）。")
+                    aborted = True
+                    break
+
                 page.wait_for_timeout(delay_ms)
         browser.close()
     return rows
