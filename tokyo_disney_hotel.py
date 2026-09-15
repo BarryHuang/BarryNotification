@@ -272,6 +272,23 @@ def classify_page(text):
     return "UNKNOWN", "頁面無明確訊息，版面可能已變更"
 
 
+PRICE_RE = re.compile(r'([\d][\d,]{2,})\s*円')
+
+
+def extract_prices(text):
+    """抓出頁面上的日圓金額，濾掉明顯不是房價的數字，回傳排序後的 list[int]。"""
+    values = []
+    for raw in PRICE_RE.findall(text):
+        try:
+            value = int(raw.replace(",", ""))
+        except ValueError:
+            continue
+        # 迪士尼飯店一晚大約 3 萬 ~ 30 萬日圓；其餘多半是點數、稅金、說明文字
+        if 10000 <= value <= 1000000:
+            values.append(value)
+    return sorted(set(values))
+
+
 def check_hotel(page, hotel_cd, use_date, staying_days):
     url = build_search_url(hotel_cd, use_date, staying_days)
     try:
@@ -309,6 +326,136 @@ def run_searches(searches):
             results[label] = rows
         browser.close()
     return results
+
+
+def scan_range(hotel_codes, start_date, days, staying_days=1, delay_ms=2500):
+    """逐日掃描指定飯店的空房與價格。
+
+    回傳 [{date, hotel_cd, hotel_name, status, prices, url}, ...]
+    每次查詢之間會停頓 delay_ms，避免對官網造成壓力而被擋。
+    """
+    from playwright.sync_api import sync_playwright
+
+    hotel_names = dict(HOTELS)
+    rows = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=BROWSER_UA,
+            locale="ja-JP",
+            viewport={"width": 1280, "height": 900},
+        )
+        page = context.new_page()
+        for offset in range(days):
+            use_date = start_date + datetime.timedelta(days=offset)
+            for hotel_cd in hotel_codes:
+                url = build_search_url(hotel_cd, use_date, staying_days)
+                prices = []
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=PAGE_TIMEOUT_MS)
+                    page.wait_for_timeout(2500)
+                    text = page.inner_text("body")
+                    status, _ = classify_page(text)
+                    prices = extract_prices(text)
+                except Exception as e:
+                    status = "UNKNOWN"
+                    print(f"  ! {use_date} {hotel_cd} 載入失敗：{e}")
+
+                rows.append({
+                    "date": use_date,
+                    "hotel_cd": hotel_cd,
+                    "hotel_name": hotel_names.get(hotel_cd, hotel_cd),
+                    "status": status,
+                    "prices": prices,
+                    "url": url,
+                })
+                cheapest = f"{prices[0]:,} 円起" if prices else "-"
+                print(f"  {use_date} ({WEEKDAY_TW[use_date.weekday()]}) {hotel_cd}: {status:9} {cheapest}")
+                page.wait_for_timeout(delay_ms)
+        browser.close()
+    return rows
+
+
+def render_scan_report(rows, start_date, days, staying_days):
+    """把掃描結果排成一張表。"""
+    hotel_codes = []
+    for row in rows:
+        if row["hotel_cd"] not in hotel_codes:
+            hotel_codes.append(row["hotel_cd"])
+    hotel_names = dict(HOTELS)
+    by_key = {(r["date"], r["hotel_cd"]): r for r in rows}
+
+    mark = {"AVAILABLE": "O", "SOLD_OUT": "X", "NOT_OPEN": "-", "BLOCKED": "?", "UNKNOWN": "?"}
+
+    lines = []
+    lines.append(f"掃描區間：{start_date} 起 {days} 天，每次 {staying_days} 晚，"
+                 f"{ADULT_NUM} 大人 / {ROOMS_NUM} 房")
+    lines.append("")
+    header = f"{'日期':<14}"
+    for cd in hotel_codes:
+        header += f"{cd:>22}"
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for offset in range(days):
+        d = start_date + datetime.timedelta(days=offset)
+        line = f"{d:%m/%d}({WEEKDAY_TW[d.weekday()]})    "
+        for cd in hotel_codes:
+            row = by_key.get((d, cd))
+            if not row:
+                line += f"{'':>22}"
+                continue
+            flag = mark.get(row["status"], "?")
+            price = f"{row['prices'][0]:,}円" if row["prices"] else ""
+            line += f"{flag + ' ' + price:>22}"
+        lines.append(line)
+
+    lines.append("")
+    lines.append("O=有空房  X=客滿  -=未開放  ?=無法判斷（官網擋查詢或版面改變）")
+    for cd in hotel_codes:
+        lines.append(f"  {cd} = {hotel_names.get(cd, cd)}")
+
+    available = [r for r in rows if r["status"] == "AVAILABLE"]
+    lines.append("")
+    if available:
+        lines.append(f"== 有空房的日期（共 {len(available)} 筆）==")
+        for r in sorted(available, key=lambda r: (r["date"], r["hotel_cd"])):
+            price = f"{r['prices'][0]:,} 円起" if r["prices"] else "價格未擷取到"
+            lines.append(f"  {r['date']} ({WEEKDAY_TW[r['date'].weekday()]}) "
+                         f"{r['hotel_name']}：{price}")
+            lines.append(f"    {r['url']}")
+    else:
+        lines.append("== 這個區間沒有掃到任何空房 ==")
+
+    blocked = [r for r in rows if r["status"] in ("BLOCKED", "UNKNOWN")]
+    if blocked:
+        lines.append("")
+        lines.append(f"⚠️ 有 {len(blocked)} 筆無法判斷（官網可能擋下自動查詢），請以官網為準。")
+
+    return "\n".join(lines)
+
+
+def run_scan(argv):
+    """--scan 模式：掃描一段期間的空房與價格，只輸出到 log，不發 LINE。"""
+    def arg(name, default):
+        if name in argv:
+            return argv[argv.index(name) + 1]
+        return default
+
+    start_raw = arg("--start", None)
+    start_date = (datetime.datetime.strptime(start_raw, "%Y-%m-%d").date()
+                  if start_raw else datetime.datetime.now(tz=JST).date())
+    days = int(arg("--days", "30"))
+    staying_days = int(arg("--nights", "1"))
+    codes = arg("--hotels", "FSH,DHM").split(",")
+
+    print(f"開始掃描：{start_date} 起 {days} 天，飯店 {codes}，每次 {staying_days} 晚")
+    rows = scan_range(codes, start_date, days, staying_days)
+    report = render_scan_report(rows, start_date, days, staying_days)
+    print()
+    print("===== SCAN REPORT =====")
+    print(report)
+    print("===== END REPORT =====")
 
 
 STATUS_LABEL = {
@@ -440,4 +587,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--scan" in sys.argv:
+        run_scan(sys.argv)
+    else:
+        main()
