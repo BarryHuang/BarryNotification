@@ -297,11 +297,12 @@ def check_hotel(page, hotel_cd, use_date, staying_days):
         text = page.inner_text("body")
     except Exception as e:
         print(f"  [{hotel_cd}] page load error: {e}")
-        return {"status": "UNKNOWN", "detail": f"頁面載入失敗：{e}", "url": url}
+        return {"status": "UNKNOWN", "detail": f"頁面載入失敗：{e}", "url": url,
+                "hotel_cd": hotel_cd}
 
     status, detail = classify_page(text)
     print(f"  [{hotel_cd}] {use_date} x{staying_days}晚 → {status} ({detail})")
-    return {"status": status, "detail": detail, "url": url}
+    return {"status": status, "detail": detail, "url": url, "hotel_cd": hotel_cd}
 
 
 def run_searches(searches):
@@ -482,16 +483,107 @@ def format_rows(rows):
     return "\n".join(lines)
 
 
+# === 狀態檔（只在「新出現空房」時才通知，避免每小時洗版）===
+
+STATE_PATH = os.path.join("docs", "data", "disney_seen.json")
+
+# 連續幾次都讀不到官網就發一次「監控壞掉」警告。
+# 現在改成「沒消息＝沒空房」，所以監控啞掉一定要讓人知道。
+BLOCKED_ALERT_THRESHOLD = 12
+
+
+def load_state():
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    """只有實質內容變動時才寫檔。
+
+    每小時跑一次，如果連時間戳都寫進去，會每小時多一筆沒有意義的 commit。
+    """
+    payload = {k: v for k, v in state.items() if k != "updated"}
+    old_payload = {k: v for k, v in load_state().items() if k != "updated"}
+    if payload == old_payload:
+        print("狀態沒有變化，不改寫狀態檔。")
+        return False
+
+    parent = os.path.dirname(STATE_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=1, sort_keys=True)
+    return True
+
+
+def diff_availability(results, prev_available):
+    """比對本次與上次的空房狀態。
+
+    回傳 (now_available, newly_available, definitive_count)。
+    查詢被擋或判讀不出來時「沿用上次的狀態」，避免一次誤判就
+    把房間當成消失、下次又報一次新空房。
+    """
+    now_available = set()
+    newly = set()
+    definitive = 0
+
+    for label, rows in results.items():
+        for hotel_name, res in rows:
+            key = f"{label}|{res['hotel_cd']}"
+            if res["status"] in ("AVAILABLE", "SOLD_OUT", "NOT_OPEN"):
+                definitive += 1
+                if res["status"] == "AVAILABLE":
+                    now_available.add(key)
+                    if key not in prev_available:
+                        newly.add(key)
+            elif key in prev_available:
+                now_available.add(key)
+
+    return now_available, newly, definitive
+
+
 # === Main ===
+
+def build_searches(now, open_by_night, combined_open, full_sweep):
+    """決定這一輪要跑哪些查詢。
+
+    每小時跑的只查「連住 2 晚」（6 個頁面），把對官網的請求壓到最低；
+    單晚查詢只在每天一次的全掃描，或連住還沒開賣但單晚已開賣時才做。
+    """
+    searches = []
+    if now >= combined_open:
+        searches.append((
+            f"連住 2 晚（{fmt_date(CHECKIN_DATE)} 入住 → {fmt_date(CHECKOUT_DATE)} 退房）",
+            CHECKIN_DATE, 2,
+        ))
+    for d, open_at in open_by_night:
+        if now < open_at:
+            continue
+        # 連住還沒開賣時，單晚是唯一能搶的東西，一定要查
+        if full_sweep or now < combined_open:
+            searches.append((f"單晚 {fmt_date(d)}", d, 1))
+    return searches
+
 
 def main():
     send_line = "--no-line" not in sys.argv
+    force_notify = "--force-notify" in sys.argv
+    full_sweep = "--full" in sys.argv
 
     now = datetime.datetime.now(tz=JST)
     now_text = now.strftime("%Y-%m-%d %H:%M JST")
 
     open_by_night = [(d, reservation_open_at(d)) for d in STAY_NIGHTS]
     combined_open = max(t for _, t in open_by_night)
+    soonest_open = min(t for _, t in open_by_night)
+
+    state = load_state()
+    prev_available = set(state.get("available", []))
+    notified = set(state.get("notified", []))
+    blocked_streak = int(state.get("blocked_streak", 0))
 
     # --- 開賣時程 ---
     schedule_lines = []
@@ -501,7 +593,6 @@ def main():
         )
     schedule_text = "\n".join(schedule_lines)
 
-    # 若有哪一晚因為「4 個月前該月無同一天」而順延，附上說明
     rollover_lines = []
     for d, open_at in open_by_night:
         if open_at.day != d.day:
@@ -512,48 +603,95 @@ def main():
             )
     rollover_text = ("\n".join(rollover_lines) + "\n") if rollover_lines else ""
 
-    # --- 決定要跑哪些查詢 ---
-    searches = []
-    if now >= combined_open:
-        searches.append((
-            f"連住 2 晚（{fmt_date(CHECKIN_DATE)} 入住 → {fmt_date(CHECKOUT_DATE)} 退房）",
-            CHECKIN_DATE, 2,
-        ))
-    for d, open_at in open_by_night:
-        if now >= open_at:
-            searches.append((f"單晚 {fmt_date(d)}", d, 1))
+    # --- 查詢 ---
+    searches = build_searches(now, open_by_night, combined_open, full_sweep)
 
-    urgent = False
+    results, newly, now_available = {}, set(), set()
+    definitive = 0
     if searches:
-        print(f"開賣中，執行 {len(searches)} 組查詢……")
+        print(f"執行 {len(searches)} 組查詢……")
         results = run_searches(searches)
-        blocks = []
-        for label, _, _ in searches:
-            rows = results[label]
-            if any(r["status"] == "AVAILABLE" for _, r in rows):
-                urgent = True
-            blocks.append(f"【{label}】\n{format_rows(rows)}")
-        result_text = "\n\n".join(blocks)
-    else:
-        soonest = min(t for _, t in open_by_night)
-        result_text = (
-            "尚未開賣，今天不查詢官網。\n"
-            f"最快可訂的一晚是 {fmt_date(STAY_NIGHTS[0])}，"
-            f"{humanize_delta(soonest - now)}開賣。"
+        now_available, newly, definitive = diff_availability(results, prev_available)
+        result_text = "\n\n".join(
+            f"【{label}】\n{format_rows(results[label])}" for label, _, _ in searches
         )
-        if soonest - now <= datetime.timedelta(days=1):
-            urgent = True
+    else:
+        result_text = (
+            "尚未開賣，這一輪不查詢官網。\n"
+            f"最快可訂的一晚是 {fmt_date(STAY_NIGHTS[0])}，"
+            f"{humanize_delta(soonest_open - now)}開賣。"
+        )
 
-    if now < combined_open and combined_open - now <= datetime.timedelta(days=1):
-        urgent = True
+    # --- 監控健康度：連續讀不到官網就示警一次 ---
+    health_alert = None
+    if searches:
+        if definitive == 0:
+            # 超過警告門檻就不再往上加，故障期間才不會一直改寫狀態檔
+            blocked_streak = min(blocked_streak + 1, BLOCKED_ALERT_THRESHOLD + 1)
+        else:
+            if blocked_streak >= BLOCKED_ALERT_THRESHOLD:
+                health_alert = "✅ 監控恢復正常，已經可以正常讀取官網。"
+            blocked_streak = 0
+        if blocked_streak == BLOCKED_ALERT_THRESHOLD:
+            health_alert = (
+                f"⚠️ 監控異常：連續 {blocked_streak} 次都讀不到官網（可能被反爬蟲擋）。\n"
+                "這段期間「沒收到通知」不等於「沒有空房」，請自行到官網確認。"
+            )
 
-    header = "🚨🚨 " if urgent else ""
+    # --- 開賣提醒：每個開賣時間點各提醒一次（前一天 / 當天）---
+    open_alerts = []
+    for d, open_at in open_by_night:
+        for tag, within, wording in (
+            ("d1", datetime.timedelta(days=1), "明天"),
+            ("d0", datetime.timedelta(hours=3), "快要"),
+        ):
+            key = f"open|{d}|{tag}"
+            if key in notified or now >= open_at:
+                continue
+            if open_at - now <= within:
+                open_alerts.append(
+                    f"⏰ {fmt_date(d)} 這晚{wording}開賣了！\n"
+                    f"　 {fmt_dt(open_at)}（{humanize_delta(open_at - now)}）"
+                )
+                notified.add(key)
+
+    # --- 決定要不要發 LINE ---
+    reasons = []
+    if newly:
+        reasons.append("有新的空房")
+    if open_alerts:
+        reasons.append("開賣提醒")
+    if health_alert:
+        reasons.append("監控狀態")
+    if force_notify:
+        reasons.append("手動強制發送")
+
+    if newly:
+        header = "🚨🚨 有空房了！快去搶！\n\n"
+        newly_lines = ["== 這次新出現的空房 =="]
+        for label, rows in results.items():
+            for hotel_name, res in rows:
+                if f"{label}|{res['hotel_cd']}" in newly:
+                    newly_lines.append(f"  ✅ {hotel_name}｜{label}")
+                    newly_lines.append(f"     {res['detail']}")
+                    newly_lines.append(f"     🔗 {res['url']}")
+        highlight = "\n".join(newly_lines) + "\n\n"
+    else:
+        header = ""
+        highlight = ""
+
+    alert_text = ("\n".join(open_alerts) + "\n\n") if open_alerts else ""
+    health_text = (health_alert + "\n\n") if health_alert else ""
 
     body = (
-        f"{header}🏰 東京迪士尼飯店訂房監控\n"
+        f"{header}"
+        f"🏰 東京迪士尼飯店訂房監控\n"
         f"📅 報告時間：{now_text}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"\n"
+        f"{highlight}"
+        f"{alert_text}"
+        f"{health_text}"
         f"🛏 目標行程：{fmt_date(CHECKIN_DATE)} 入住 → {fmt_date(CHECKOUT_DATE)} 退房\n"
         f"　（住 {len(STAY_NIGHTS)} 晚：{fmt_date(STAY_NIGHTS[0])}、{fmt_date(STAY_NIGHTS[1])}）\n"
         f"　{ADULT_NUM} 位大人 / {ROOMS_NUM} 間房\n"
@@ -575,6 +713,20 @@ def main():
     print("Execution result:")
     print(body)
 
+    # --- 寫回狀態 ---
+    state["updated"] = now.isoformat(timespec="seconds")
+    state["available"] = sorted(now_available)
+    state["notified"] = sorted(notified)
+    state["blocked_streak"] = blocked_streak
+    save_state(state)
+    print(f"狀態已寫入 {STATE_PATH}：空房 {len(now_available)} 筆、"
+          f"新出現 {len(newly)} 筆、連續讀取失敗 {blocked_streak} 次")
+
+    if not reasons:
+        print("沒有新空房也沒有提醒事項，這一輪不發 LINE。")
+        return
+
+    print(f"發送 LINE，原因：{'、'.join(reasons)}")
     if not send_line:
         print("--no-line 指定，略過 LINE 廣播。")
         return
@@ -586,8 +738,22 @@ def main():
         print("Skipping LINE broadcast as tokens are not configured.")
 
 
+def needs_browser():
+    """給 workflow 用：這一輪到底需不需要開瀏覽器。
+
+    開賣前根本不會查官網，就不用每小時花時間裝 chromium。
+    """
+    now = datetime.datetime.now(tz=JST)
+    open_by_night = [(d, reservation_open_at(d)) for d in STAY_NIGHTS]
+    combined_open = max(t for _, t in open_by_night)
+    searches = build_searches(now, open_by_night, combined_open, "--full" in sys.argv)
+    return bool(searches)
+
+
 if __name__ == "__main__":
-    if "--scan" in sys.argv:
+    if "--needs-browser" in sys.argv:
+        print("yes" if needs_browser() else "no")
+    elif "--scan" in sys.argv:
         run_scan(sys.argv)
     else:
         main()
