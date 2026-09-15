@@ -1,9 +1,11 @@
-name: Tokyo Disney Hotel Monitor (2027/01/30-02/01)
+name: Tokyo Disney Hotel Monitor (2027/01)
 
 on:
   schedule:
-    # 每小時查一次。開賣後才會真的連官網，開賣前只做倒數判斷，幾秒就跑完。
-    - cron: '0 * * * *'
+    # 每 3 小時查一次。區間是 31 天 x 2 間飯店，每小時跑對官網壓力太大、
+    # 也容易被反爬蟲盯上。未開賣的日期不會查，所以初期更輕。
+    # UTC 0 那輪 = JST 09:00，每日總覽就落在這一輪。
+    - cron: '0 */3 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -54,16 +56,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 每天 UTC 22:00 那一輪做完整掃描（連住 + 單晚），其餘只查連住 2 晚，
-      # 把每小時打到官網的請求量壓到最低。
+      # 區間內全部日期都還沒開賣時不需要瀏覽器，省下裝 chromium 的時間
       - name: Decide run shape
         id: plan
         run: |
-          if [ "$(date -u +%H)" = "22" ]; then
-            echo "full=--full" >> "$GITHUB_OUTPUT"
-          else
-            echo "full=" >> "$GITHUB_OUTPUT"
-          fi
           echo "browser=$(python tokyo_disney_hotel.py --needs-browser)" >> "$GITHUB_OUTPUT"
 
       - name: Install Playwright
@@ -79,10 +75,9 @@ jobs:
           LINE_CLIENT_SECRET: ${{ secrets.LINE_CLIENT_SECRET }}
         run: |
           python tokyo_disney_hotel.py \
-            ${{ steps.plan.outputs.full }} \
             ${{ inputs.force_notify && '--force-notify' || '' }}
 
-      # 記住上一輪的空房狀態，這樣同一間房不會每小時重複通知。
+      # 記住上一輪的空房狀態，這樣同一筆空房不會每輪重複通知。
       # 狀態沒變就不會寫檔，也就不會有多餘的 commit。
       - name: Persist monitor state
         if: ${{ inputs.mode != 'scan' }}
