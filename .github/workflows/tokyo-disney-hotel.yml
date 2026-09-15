@@ -2,10 +2,40 @@ name: Tokyo Disney Hotel Monitor (2027/01/30-02/01)
 
 on:
   schedule:
-    # GitHub Actions 排程通常延遲 2~3 小時，設定 UTC 22:00 (台灣 06:00) 補償延遲，
-    # 預計台灣 08:00~09:00 收到通知。官網開賣時間是台灣 10:00，來得及準備。
-    - cron: '0 22 * * *'
-  workflow_dispatch: # 允許在網頁上手動點擊執行測試
+    # 每小時查一次。開賣後才會真的連官網，開賣前只做倒數判斷，幾秒就跑完。
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '執行模式'
+        type: choice
+        options:
+          - monitor
+          - scan
+        default: monitor
+      force_notify:
+        description: 'monitor 模式：就算沒有新空房也強制發一則 LINE（測試用）'
+        type: boolean
+        default: false
+      scan_start:
+        description: 'scan 模式：起始日 YYYY-MM-DD（留空=今天）'
+        type: string
+        default: ''
+      scan_days:
+        description: 'scan 模式：掃描天數'
+        type: string
+        default: '30'
+      scan_nights:
+        description: 'scan 模式：每次連住幾晚'
+        type: string
+        default: '1'
+      scan_hotels:
+        description: 'scan 模式：飯店代碼（逗號分隔）FSH/DHM/TDH/DAH/TSH/DCH'
+        type: string
+        default: 'FSH,DHM'
+
+permissions:
+  contents: write
 
 concurrency:
   group: tokyo-disney-hotel
@@ -14,6 +44,7 @@ concurrency:
 jobs:
   check-booking:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -23,14 +54,56 @@ jobs:
         with:
           python-version: '3.11'
 
+      # 每天 UTC 22:00 那一輪做完整掃描（連住 + 單晚），其餘只查連住 2 晚，
+      # 把每小時打到官網的請求量壓到最低。
+      - name: Decide run shape
+        id: plan
+        run: |
+          if [ "$(date -u +%H)" = "22" ]; then
+            echo "full=--full" >> "$GITHUB_OUTPUT"
+          else
+            echo "full=" >> "$GITHUB_OUTPUT"
+          fi
+          echo "browser=$(python tokyo_disney_hotel.py --needs-browser)" >> "$GITHUB_OUTPUT"
+
       - name: Install Playwright
+        if: ${{ inputs.mode == 'scan' || steps.plan.outputs.browser == 'yes' }}
         run: |
           pip install playwright
           playwright install --with-deps chromium
 
-      - name: Run script
+      - name: Run monitor
+        if: ${{ inputs.mode != 'scan' }}
         env:
           LINE_CLIENT_ID: ${{ secrets.LINE_CLIENT_ID }}
           LINE_CLIENT_SECRET: ${{ secrets.LINE_CLIENT_SECRET }}
         run: |
-          python tokyo_disney_hotel.py
+          python tokyo_disney_hotel.py \
+            ${{ steps.plan.outputs.full }} \
+            ${{ inputs.force_notify && '--force-notify' || '' }}
+
+      # 記住上一輪的空房狀態，這樣同一間房不會每小時重複通知。
+      # 狀態沒變就不會寫檔，也就不會有多餘的 commit。
+      - name: Persist monitor state
+        if: ${{ inputs.mode != 'scan' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/data/disney_seen.json
+          if git diff --cached --quiet; then
+            echo "狀態無變動，不需 commit。"
+          else
+            git commit -m "更新迪士尼訂房監控狀態 $(date -u +'%Y-%m-%dT%H:%MZ')"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      # scan 只把結果印在 log，不發 LINE
+      - name: Run availability scan
+        if: ${{ inputs.mode == 'scan' }}
+        run: |
+          python tokyo_disney_hotel.py --scan \
+            ${{ inputs.scan_start && format('--start {0}', inputs.scan_start) || '' }} \
+            --days "${{ inputs.scan_days }}" \
+            --nights "${{ inputs.scan_nights }}" \
+            --hotels "${{ inputs.scan_hotels }}"
