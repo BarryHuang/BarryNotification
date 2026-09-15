@@ -62,6 +62,29 @@ jobs:
         run: |
           echo "browser=$(python tokyo_disney_hotel.py --needs-browser)" >> "$GITHUB_OUTPUT"
 
+      # 診斷用：確認 runner 到底連不連得到官網。
+      # Playwright 回報 url=about:blank，代表導覽完全沒開始，
+      # 需要分辨是「網路層被丟包」還是「應用層擋下」。
+      - name: Connectivity check
+        if: ${{ inputs.mode != 'scan' }}
+        continue-on-error: true
+        run: |
+          echo "--- 對照組：一般網站 ---"
+          curl -sS -o /dev/null --max-time 20 \
+            -w 'example.com  http=%{http_code}  connect=%{time_connect}s  total=%{time_total}s\n' \
+            https://example.com || echo "example.com 連線失敗（exit $?）"
+
+          echo "--- 目標：迪士尼訂房站 ---"
+          curl -sS -o /tmp/tdr.html --max-time 30 \
+            -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' \
+            -w 'reserve.tokyodisneyresort.jp  http=%{http_code}  connect=%{time_connect}s  total=%{time_total}s  size=%{size_download}\n' \
+            'https://reserve.tokyodisneyresort.jp/hotel/search/' \
+            || echo "迪士尼站連線失敗（curl exit $?）→ 網路層被丟包的可能性高"
+
+          echo "--- 回應內容前 400 字 ---"
+          head -c 400 /tmp/tdr.html 2>/dev/null || echo "(沒有收到任何內容)"
+          echo
+
       - name: Install Playwright
         if: ${{ inputs.mode == 'scan' || steps.plan.outputs.browser == 'yes' }}
         run: |

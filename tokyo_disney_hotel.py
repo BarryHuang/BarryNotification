@@ -735,20 +735,32 @@ def render_digest(rows, now, newly=frozenset()):
     mark = {"AVAILABLE": "⭕", "SOLD_OUT": "✖", "NOT_OPEN": "🔒", "BLOCKED": "❔", "UNKNOWN": "❔"}
 
     lines = []
+    unchecked = 0
     for d in target_dates():
+        # 沒有資料可能是「還沒開賣所以不查」，也可能是「這一輪中途中止沒查到」，
+        # 兩者意義完全不同，不能混用同一個符號。
+        is_open = now >= reservation_open_at(d)
         cells = []
         for cd in MONITOR_HOTELS:
             row = by_key.get(f"{d}|{cd}")
             if row is None:
-                # 尚未開賣，連查都沒查
-                cells.append(f"{cd} 🔒")
+                if is_open:
+                    unchecked += 1
+                    cells.append(f"{cd} ⏸")
+                else:
+                    cells.append(f"{cd} 🔒")
             elif row["status"] == "AVAILABLE":
                 cells.append(f"{cd} ⭕ {price_text(row)}")
             else:
                 cells.append(f"{cd} {mark.get(row['status'], '❔')}")
         lines.append(f"{d:%m/%d}({WEEKDAY_TW[d.weekday()]})  " + "　".join(cells))
 
-    legend = "⭕有空房  ✖客滿  🔒未開賣  ❔讀不到"
+    if unchecked:
+        lines.append("")
+        lines.append(f"⚠️ 有 {unchecked} 筆已開賣但這一輪沒查到（掃描中途中止），"
+                     "狀態未知，請以官網為準。")
+
+    legend = "⭕有空房  ✖客滿  🔒未開賣  ⏸本輪未查  ❔讀不到"
     hotels = "　".join(f"{cd}={hotel_names.get(cd, cd)}" for cd in MONITOR_HOTELS)
 
     available = sorted((r for r in rows if r["status"] == "AVAILABLE"), key=lambda r: r["key"])
