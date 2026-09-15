@@ -46,6 +46,10 @@ MONITOR_HOTELS = ["FSH", "DHM"]
 # 每日總覽在日本時間這個鐘點那一輪發送
 DIGEST_HOUR_JST = 8
 
+# 總覽裡最多詳列幾筆空房（含房型與連結）。LINE 單則有字數上限，
+# 空房很多時只詳列前幾筆，其餘用精簡一行帶過。
+DIGEST_DETAIL_LIMIT = 8
+
 ROOMS_NUM = 1
 ADULT_NUM = 2
 CHILD_NUM = 0
@@ -290,6 +294,45 @@ def classify_page(text):
     return "UNKNOWN", "頁面無明確訊息，版面可能已變更"
 
 
+# === 房型擷取 ===
+
+# 官方房型介紹頁（FSH 分兩棟，各給一條）
+ROOM_PAGES = {
+    "FSH": [
+        ("ファンタジーシャトー", "https://www.tokyodisneyresort.jp/hotel/fsh/fcu/room.html"),
+        ("グランドシャトー", "https://www.tokyodisneyresort.jp/hotel/fsh/gcu/room.html"),
+    ],
+    "DHM": [("客室一覧", "https://www.tokyodisneyresort.jp/hotel/dhm/room.html")],
+    "TDH": [("客室一覧", "https://www.tokyodisneyresort.jp/hotel/tdh/room.html")],
+    "DAH": [("客室一覧", "https://www.tokyodisneyresort.jp/hotel/dah/room.html")],
+    "TSH": [("客室一覧", "https://www.tokyodisneyresort.jp/hotel/tsh/room.html")],
+    "DCH": [("客室一覧", "https://www.tokyodisneyresort.jp/hotel/dch/room.html")],
+}
+
+# 房型名稱的構造：〔サイド〕＋〔片假名/英數〕＋ルーム|スイート|キャビン＋〔（○○ビュー）〕
+# 用結構比對而不是寫死清單，迪士尼改名或新增房型時比較不會失效。
+ROOM_NAME_RE = re.compile(
+    r'(?:[ァ-ヶー・]{2,20}(?:サイド|シャトー)\s*)?'   # ○○サイド／○○シャトー
+    r'[ァ-ヶーA-Za-z0-9・＆&]{2,30}?'
+    r'(?:ルーム|スイート|キャビン)'
+    r'(?:\s*[＆&]\s*スイート)?'                      # スペチアーレ・ルーム＆スイート
+    r'(?:\s*[（(][^）)\n]{1,30}[）)])?'              # （ハーバービュー）
+)
+
+# 這些字樣出現在房型名稱裡通常是導覽列或說明，不是真的房型
+ROOM_NAME_BLOCKLIST = ("客室一覧", "の客室", "客室タイプ", "ルームサービス", "ルームキー")
+
+CARD_SELECTORS = [
+    "[class*='planList'] li",
+    "[class*='roomList'] li",
+    "[class*='searchResult'] li",
+    "li[class*='plan']",
+    "li[class*='room']",
+    "[class*='planUnit']",
+    "[class*='roomUnit']",
+    "article",
+]
+
 PRICE_RE = re.compile(r'([\d][\d,]{2,})\s*円')
 
 
@@ -305,6 +348,76 @@ def extract_prices(text):
         if 10000 <= value <= 1000000:
             values.append(value)
     return sorted(set(values))
+
+
+def find_room_names(text):
+    """從一段文字裡找出看起來像房型名稱的字串（保持出現順序、去重）。"""
+    names = []
+    for match in ROOM_NAME_RE.finditer(text):
+        name = " ".join(match.group(0).split())
+        if any(bad in name for bad in ROOM_NAME_BLOCKLIST):
+            continue
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def extract_offers(page, text):
+    """擷取「房型 + 價格」。
+
+    官網頁面結構未知且會改版，所以採兩段式：
+    先嘗試把搜尋結果拆成一張張卡片逐張讀；失敗就退回整頁文字配對。
+    兩者都抓不到時回傳空 list，呼叫端仍會附上訂房連結讓人自己看。
+    """
+    offers = []
+
+    for selector in CARD_SELECTORS:
+        try:
+            elements = page.query_selector_all(selector)
+        except Exception:
+            continue
+        # 數量太誇張的多半選到版面容器，不是方案卡片
+        if not elements or len(elements) > 80:
+            continue
+        for element in elements:
+            try:
+                card_text = element.inner_text()
+            except Exception:
+                continue
+            names = find_room_names(card_text)
+            prices = extract_prices(card_text)
+            if names and prices:
+                offers.append({"room": names[0], "price": prices[0]})
+        if offers:
+            break
+
+    if not offers:
+        # 退路：逐行掃全頁文字，房型名稱後面幾行內的第一個價格就當作它的價格
+        lines = text.splitlines()
+        for idx, line in enumerate(lines):
+            names = find_room_names(line)
+            if not names:
+                continue
+            price = None
+            for follow in lines[idx:idx + 6]:
+                found = extract_prices(follow)
+                if found:
+                    price = found[0]
+                    break
+            offers.append({"room": names[0], "price": price})
+
+    # 同房型只留最便宜的一筆
+    best = {}
+    for offer in offers:
+        room, price = offer["room"], offer["price"]
+        if room not in best or (price is not None and
+                                (best[room] is None or price < best[room])):
+            best[room] = price
+    return [{"room": r, "price": p} for r, p in best.items()]
+
+
+def room_page_links(hotel_cd):
+    return ROOM_PAGES.get(hotel_cd, [])
 
 
 def scan_range(hotel_codes, start_date, days, staying_days=1, delay_ms=2500):
@@ -334,13 +447,15 @@ def scan_dates(hotel_codes, dates, staying_days=1, delay_ms=2500):
         for use_date in dates:
             for hotel_cd in hotel_codes:
                 url = build_search_url(hotel_cd, use_date, staying_days)
-                prices = []
+                prices, offers = [], []
                 try:
                     page.goto(url, wait_until="networkidle", timeout=PAGE_TIMEOUT_MS)
                     page.wait_for_timeout(2500)
                     text = page.inner_text("body")
                     status, _ = classify_page(text)
                     prices = extract_prices(text)
+                    if status == "AVAILABLE":
+                        offers = extract_offers(page, text)
                 except Exception as e:
                     status = "UNKNOWN"
                     print(f"  ! {use_date} {hotel_cd} 載入失敗：{e}")
@@ -352,10 +467,16 @@ def scan_dates(hotel_codes, dates, staying_days=1, delay_ms=2500):
                     "hotel_name": hotel_names.get(hotel_cd, hotel_cd),
                     "status": status,
                     "prices": prices,
+                    "offers": offers,
                     "url": url,
                 })
                 cheapest = f"{prices[0]:,} 円起" if prices else "-"
-                print(f"  {use_date} ({WEEKDAY_TW[use_date.weekday()]}) {hotel_cd}: {status:9} {cheapest}")
+                rooms = f" [{len(offers)} 種房型]" if offers else ""
+                print(f"  {use_date} ({WEEKDAY_TW[use_date.weekday()]}) {hotel_cd}: "
+                      f"{status:9} {cheapest}{rooms}")
+                for offer in offers:
+                    price = f"{offer['price']:,} 円" if offer["price"] else "價格未擷取"
+                    print(f"      - {offer['room']}：{price}")
                 page.wait_for_timeout(delay_ms)
         browser.close()
     return rows
@@ -508,7 +629,24 @@ def price_text(row):
     return f"{row['prices'][0]:,} 円起" if row["prices"] else "價格未擷取"
 
 
-def render_digest(rows, now):
+def room_detail_lines(row, indent="     "):
+    """有空房時列出房型、價格，以及訂房／房型介紹連結。"""
+    lines = []
+    offers = row.get("offers") or []
+    if offers:
+        for offer in sorted(offers, key=lambda o: (o["price"] is None, o["price"] or 0)):
+            price = f"{offer['price']:,} 円" if offer["price"] else "價格未擷取"
+            lines.append(f"{indent}🛏 {offer['room']}：{price}")
+    else:
+        lines.append(f"{indent}🛏 房型未擷取到（版面可能已改），請點連結確認")
+
+    lines.append(f"{indent}🔗 直接訂房：{row['url']}")
+    for label, url in room_page_links(row["hotel_cd"]):
+        lines.append(f"{indent}📖 房型介紹（{label}）：{url}")
+    return lines
+
+
+def render_digest(rows, now, newly=frozenset()):
     """每日總覽：整個區間逐日的空房與價格。"""
     by_key = {r["key"]: r for r in rows}
     hotel_names = dict(HOTELS)
@@ -533,10 +671,20 @@ def render_digest(rows, now):
 
     available = sorted((r for r in rows if r["status"] == "AVAILABLE"), key=lambda r: r["key"])
     if available:
-        summary = [f"✅ 目前有空房的日期（{len(available)} 筆）："]
-        for r in available:
-            summary.append(f"  {r['date']:%m/%d}({WEEKDAY_TW[r['date'].weekday()]}) "
-                           f"{r['hotel_name']}：{price_text(r)}")
+        summary = [f"✅ 目前有空房的日期（{len(available)} 筆）：", ""]
+        for r in available[:DIGEST_DETAIL_LIMIT]:
+            flag = "🆕 " if r["key"] in newly else ""
+            summary.append(f"  {flag}{r['date']:%m/%d}({WEEKDAY_TW[r['date'].weekday()]}) "
+                           f"{r['hotel_name']}")
+            summary.extend(room_detail_lines(r))
+            summary.append("")
+        rest = available[DIGEST_DETAIL_LIMIT:]
+        if rest:
+            summary.append(f"（另有 {len(rest)} 筆空房，詳情請見下方逐日表與官網）")
+            for r in rest:
+                summary.append(f"  {r['date']:%m/%d}({WEEKDAY_TW[r['date'].weekday()]}) "
+                               f"{r['hotel_cd']}：{price_text(r)}")
+            summary.append("")
     else:
         summary = ["目前區間內沒有任何空房。"]
 
@@ -547,9 +695,10 @@ def render_newly(rows, newly):
     lines = ["== 這次新出現的空房 =="]
     for row in sorted((r for r in rows if r["key"] in newly), key=lambda r: r["key"]):
         lines.append(f"  ✅ {row['date']:%m/%d}({WEEKDAY_TW[row['date'].weekday()]}) "
-                     f"{row['hotel_name']}：{price_text(row)}")
-        lines.append(f"     🔗 {row['url']}")
-    return "\n".join(lines)
+                     f"{row['hotel_name']}")
+        lines.extend(room_detail_lines(row))
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 # === Main ===
@@ -640,7 +789,12 @@ def main():
     parts = []
     if newly:
         parts.append("🚨🚨 有空房了！快去搶！\n")
-        parts.append(render_newly(rows, newly))
+        # 同一輪如果也要發總覽，總覽本身就會列出所有空房（新的標 🆕），
+        # 這裡不再重複一份明細。
+        if digest_due:
+            parts.append(f"（本輪新增 {len(newly)} 筆空房，詳見下方總覽的 🆕 標記）")
+        else:
+            parts.append(render_newly(rows, newly))
         parts.append("")
     if open_alerts:
         parts.append("\n".join(open_alerts))
@@ -660,7 +814,7 @@ def main():
         parts.append(f"\n區間內還沒有任何日期開賣。\n"
                      f"最快是 {fmt_date(target_dates()[0])}，{humanize_delta(soonest - now)}開賣。")
     elif digest_due or force_notify:
-        table, legend, hotels, summary = render_digest(rows, now)
+        table, legend, hotels, summary = render_digest(rows, now, newly)
         parts.append("")
         parts.append(summary)
         parts.append("")
