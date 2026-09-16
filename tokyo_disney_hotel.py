@@ -84,6 +84,12 @@ READY_MARKERS = (
     "見つかりませんでした", "受け付けておりません",
 )
 
+# 官網忙碌時會把人送進 Queue-it 等候室。排隊本來就該讓程式去等，
+# 所以遇到等候室就掛在那裡直到放行（Queue-it 會自己轉址回來）。
+# 放行後 cookie 會留在同一個瀏覽器 context，後續日期不必重新排隊。
+QUEUE_MAX_WAIT_MS = 20 * 60 * 1000   # 最多陪等 20 分鐘
+QUEUE_POLL_MS = 5000
+
 # 診斷輸出：頁面判讀不出來時，印出前幾筆的實際內容供除錯
 DIAGNOSTIC_SAMPLES = 2
 
@@ -399,14 +405,63 @@ def extract_prices(text):
     return sorted(set(values))
 
 
+def in_queue(page):
+    """目前是否被擋在 Queue-it 等候室。"""
+    try:
+        if "reserve-q." in (page.url or "").lower():
+            return True
+        text = page.inner_text("body")
+    except Exception:
+        return False
+    lower = text.lower()
+    return any(pat in lower or pat in text for pat in QUEUE_PATTERNS)
+
+
+def wait_out_queue(page, url):
+    """在等候室排隊直到放行。
+
+    Queue-it 輪到就會自己轉址回官網，所以這裡只要等著。
+    這正是自動化該做的事——讓程式去等，而不是讓人盯著進度條。
+    回傳 True 表示已放行，False 表示等超過上限。
+    """
+    if not in_queue(page):
+        return True
+
+    print(f"  ⏳ 進入等候室排隊（最多等 {QUEUE_MAX_WAIT_MS // 60000} 分鐘）……")
+    waited = 0
+    while waited < QUEUE_MAX_WAIT_MS:
+        page.wait_for_timeout(QUEUE_POLL_MS)
+        waited += QUEUE_POLL_MS
+        if not in_queue(page):
+            print(f"  ✅ 排隊結束（等了 {waited // 1000} 秒），繼續查詢。")
+            # 放行後可能停在首頁，重新導向原本要查的網址
+            try:
+                if "hotel/list" not in (page.url or ""):
+                    page.goto(url, wait_until="domcontentloaded",
+                              timeout=PAGE_TIMEOUT_MS)
+            except Exception as e:
+                print(f"  ! 排隊後重新載入失敗：{str(e).splitlines()[0]}")
+            return True
+        if waited % 60000 == 0:
+            print(f"     仍在排隊……已等 {waited // 60000} 分鐘")
+
+    print(f"  ⚠️ 排隊超過 {QUEUE_MAX_WAIT_MS // 60000} 分鐘仍未放行，放棄這一輪。")
+    return False
+
+
 def load_search_page(page, url):
     """載入搜尋結果頁並回傳頁面文字。
 
     不使用 wait_until="networkidle"：官網背景有持續的請求，這個條件
     實際上永遠不會成立（實測整批 60 秒逾時）。改為等 DOM 就緒，
     再輪詢頁面文字直到出現價格／滿室等關鍵字。
+
+    若被送進等候室，會先排完隊再繼續。
     """
     page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+
+    if not wait_out_queue(page, url):
+        return page.inner_text("body") if page else ""
 
     waited = 0
     text = ""
@@ -832,9 +887,19 @@ def render_newly(rows, newly):
 
 # === Main ===
 
+def parse_dates_arg(argv):
+    """--dates 2027-01-30,2027-01-31：只查指定日期。"""
+    if "--dates" not in argv:
+        return None
+    raw = argv[argv.index("--dates") + 1]
+    return [datetime.datetime.strptime(d.strip(), "%Y-%m-%d").date()
+            for d in raw.split(",") if d.strip()]
+
+
 def main():
     send_line = "--no-line" not in sys.argv
     force_notify = "--force-notify" in sys.argv
+    only_dates = parse_dates_arg(sys.argv)
 
     now = datetime.datetime.now(tz=JST)
     now_text = now.strftime("%Y-%m-%d %H:%M JST")
@@ -845,8 +910,18 @@ def main():
     notified = set(state.get("notified", []))
     blocked_streak = int(state.get("blocked_streak", 0))
 
-    dates = open_target_dates(now)
-    pending = [d for d in target_dates() if d not in dates]
+    if only_dates:
+        # 指定日期時仍然跳過未開賣的，查了也只會看到「未開放預約」
+        dates = [d for d in only_dates if now >= reservation_open_at(d)]
+        skipped = [d for d in only_dates if d not in dates]
+        if skipped:
+            print(f"以下日期尚未開賣，略過：" +
+                  "、".join(f"{d}（{reservation_open_at(d):%m/%d %H:%M} JST 開）"
+                            for d in skipped))
+        pending = []
+    else:
+        dates = open_target_dates(now)
+        pending = [d for d in target_dates() if d not in dates]
 
     print(f"監控區間 {TARGET_START} ~ {TARGET_END}：已開賣 {len(dates)} 天、"
           f"未開賣 {len(pending)} 天；飯店 {MONITOR_HOTELS}")
