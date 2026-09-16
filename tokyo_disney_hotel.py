@@ -274,6 +274,24 @@ NOT_OPEN_PATTERNS = [
     "受付前",
     "予約受付開始",
 ]
+# 官網忙碌時會把人丟到 reserve-q.tokyodisneyresort.jp 的等候室，
+# 那是一般的排隊機制，不是被擋，也不代表沒空房，要跟「讀不到」區分開。
+QUEUE_PATTERNS = (
+    "temporarily busy",
+    "access the page in order",
+    "reserve-q.tokyodisneyresort.jp",
+    "順番",
+    "お待ちください",
+    "しばらくお待ち",
+)
+
+# 每天 3:00~5:00 JST 系統維護，站台本來就不開放
+MAINTENANCE_PATTERNS = (
+    "システムメンテナンス",
+    "system maintenance",
+    "メンテナンス中",
+)
+
 BLOCKED_PATTERNS = [
     "access denied",
     "アクセスが集中",
@@ -283,9 +301,21 @@ BLOCKED_PATTERNS = [
 ]
 
 
-def classify_page(text):
-    """回傳 (status, detail)。status: AVAILABLE / SOLD_OUT / NOT_OPEN / BLOCKED / UNKNOWN"""
+def classify_page(text, url=""):
+    """回傳 (status, detail)。
+
+    status: AVAILABLE / SOLD_OUT / NOT_OPEN / QUEUED / MAINTENANCE / BLOCKED / UNKNOWN
+    """
     lower = text.lower()
+    lower_url = (url or "").lower()
+
+    # 排隊與維護要先判，否則會被當成「版面改了讀不到」
+    if "reserve-q." in lower_url or any(
+            pat in lower or pat in text for pat in QUEUE_PATTERNS):
+        return "QUEUED", "官網忙碌中，被導到等候室排隊"
+
+    if any(pat in lower or pat in text for pat in MAINTENANCE_PATTERNS):
+        return "MAINTENANCE", "官網系統維護中（每天 3:00~5:00 JST）"
 
     for pat in BLOCKED_PATTERNS:
         if pat in lower or pat in text:
@@ -517,7 +547,7 @@ def scan_dates(hotel_codes, dates, staying_days=1, delay_ms=2500):
                 text = ""
                 try:
                     text = load_search_page(page, url)
-                    status, _ = classify_page(text)
+                    status, _ = classify_page(text, page.url)
                     prices = extract_prices(text)
                     if status == "AVAILABLE":
                         offers = extract_offers(page, text)
@@ -526,7 +556,8 @@ def scan_dates(hotel_codes, dates, staying_days=1, delay_ms=2500):
                     print(f"  ! {use_date} {hotel_cd} 載入失敗："
                           f"{str(e).splitlines()[0]}")
 
-                if status in ("UNKNOWN", "BLOCKED") and diagnosed[0] < DIAGNOSTIC_SAMPLES:
+                if status not in ("AVAILABLE", "SOLD_OUT", "NOT_OPEN") \
+                        and diagnosed[0] < DIAGNOSTIC_SAMPLES:
                     diagnosed[0] += 1
                     describe_page(page, text, f"{use_date} {hotel_cd} 判讀為 {status}")
 
@@ -540,7 +571,7 @@ def scan_dates(hotel_codes, dates, staying_days=1, delay_ms=2500):
                     "offers": offers,
                     "url": url,
                 })
-                if status in ("UNKNOWN", "BLOCKED"):
+                if status in ("UNKNOWN", "BLOCKED", "QUEUED", "MAINTENANCE"):
                     consecutive_failures += 1
                 else:
                     consecutive_failures = 0
@@ -695,6 +726,8 @@ def diff_availability(rows, prev_available):
 
     for row in rows:
         key = row["key"]
+        # QUEUED / MAINTENANCE / BLOCKED / UNKNOWN 都代表「這次沒問到」，
+        # 不能當成確定結果，否則會把還在的空房誤判成消失
         if row["status"] in ("AVAILABLE", "SOLD_OUT", "NOT_OPEN"):
             definitive += 1
             if row["status"] == "AVAILABLE":
@@ -732,7 +765,8 @@ def render_digest(rows, now, newly=frozenset()):
     """每日總覽：整個區間逐日的空房與價格。"""
     by_key = {r["key"]: r for r in rows}
     hotel_names = dict(HOTELS)
-    mark = {"AVAILABLE": "⭕", "SOLD_OUT": "✖", "NOT_OPEN": "🔒", "BLOCKED": "❔", "UNKNOWN": "❔"}
+    mark = {"AVAILABLE": "⭕", "SOLD_OUT": "✖", "NOT_OPEN": "🔒",
+            "QUEUED": "🚦", "MAINTENANCE": "🔧", "BLOCKED": "❔", "UNKNOWN": "❔"}
 
     lines = []
     unchecked = 0
@@ -760,7 +794,8 @@ def render_digest(rows, now, newly=frozenset()):
         lines.append(f"⚠️ 有 {unchecked} 筆已開賣但這一輪沒查到（掃描中途中止），"
                      "狀態未知，請以官網為準。")
 
-    legend = "⭕有空房  ✖客滿  🔒未開賣  ⏸本輪未查  ❔讀不到"
+    legend = ("⭕有空房  ✖客滿  🔒未開賣  ⏸本輪未查\n"
+              "🚦官網排隊中  🔧系統維護  ❔讀不到")
     hotels = "　".join(f"{cd}={hotel_names.get(cd, cd)}" for cd in MONITOR_HOTELS)
 
     available = sorted((r for r in rows if r["status"] == "AVAILABLE"), key=lambda r: r["key"])

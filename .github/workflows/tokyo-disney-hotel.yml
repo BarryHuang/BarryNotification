@@ -1,11 +1,13 @@
 name: Tokyo Disney Hotel Monitor (2027/01)
 
 on:
-  schedule:
-    # 每 3 小時查一次。區間是 31 天 x 2 間飯店，每小時跑對官網壓力太大、
-    # 也容易被反爬蟲盯上。未開賣的日期不會查，所以初期更輕。
-    # UTC 0 那輪 = JST 09:00，每日總覽就落在這一輪。
-    - cron: '0 */3 * * *'
+  # 2026/09/16 停用排程。實測 GitHub Actions 的 runner（Azure 機房 IP）
+  # 連不到官網：TCP 可以接上（connect 0.17s）但 30 秒內零位元組回應，
+  # 屬於接受連線後靜默丟棄。對照組 example.com 正常，確認不是程式問題。
+  # 繼續每 3 小時跑只是白耗，且一直對官網發請求，因此改為只保留手動觸發。
+  # 要恢復請把下面兩行解開註解。
+  # schedule:
+  #   - cron: '0 */3 * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -14,6 +16,7 @@ on:
         options:
           - monitor
           - scan
+          - diagnose
         default: monitor
       force_notify:
         description: 'monitor 模式：就算沒有新空房也強制發一則 LINE（測試用）'
@@ -62,11 +65,76 @@ jobs:
         run: |
           echo "browser=$(python tokyo_disney_hotel.py --needs-browser)" >> "$GITHUB_OUTPUT"
 
+      # 完整連線診斷。關鍵是分辨 TCP / TLS / HTTP 哪一層斷掉：
+      #   connect>0 但 tls=0  → TCP 接上但 TLS 沒回應（接受連線後丟包）
+      #   tls>0 但 http=000   → TLS 正常但 HTTP 無回應
+      #   http=200/302/403    → 連得到，是應用層的事（可能是排隊頁）
+      - name: Full diagnosis
+        if: ${{ inputs.mode == 'diagnose' }}
+        continue-on-error: true
+        env:
+          UA: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+        run: |
+          echo "### runner 位置"
+          curl -sS --max-time 10 https://ipinfo.io/json 2>/dev/null | head -20 || echo "(取不到)"
+          echo
+
+          echo "### DNS 解析"
+          for h in reserve.tokyodisneyresort.jp reserve-q.tokyodisneyresort.jp www.tokyodisneyresort.jp; do
+            echo "  $h"
+            getent ahostsv4 "$h" 2>/dev/null | awk '{print "    A    "$1}' | sort -u || true
+            getent ahostsv6 "$h" 2>/dev/null | awk '{print "    AAAA "$1}' | sort -u || true
+          done
+          echo
+
+          echo "### TCP 443 是否真的通"
+          for h in reserve.tokyodisneyresort.jp reserve-q.tokyodisneyresort.jp; do
+            if timeout 10 bash -c "cat < /dev/null > /dev/tcp/$h/443" 2>/dev/null; then
+              echo "  $h: TCP 443 接得上"
+            else
+              echo "  $h: TCP 443 接不上"
+            fi
+          done
+          echo
+
+          echo "### TLS handshake（只看握手，不發 HTTP）"
+          for h in reserve.tokyodisneyresort.jp reserve-q.tokyodisneyresort.jp; do
+            echo "  --- $h ---"
+            timeout 20 openssl s_client -connect "$h:443" -servername "$h" </dev/null 2>&1 \
+              | grep -E 'CONNECTED|subject=|issuer=|Protocol|Cipher|verify|no peer|errno' | head -8 \
+              || echo "    openssl 逾時或失敗 → TLS 沒完成"
+          done
+          echo
+
+          echo "### 各種請求組合"
+          probe() {
+            label="$1"; shift
+            curl -sS -o /dev/null --max-time 25 \
+              -w "  ${label}: http=%{http_code} ip=%{remote_ip} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s size=%{size_download}\n" \
+              "$@" || echo "  ${label}: curl 失敗 (exit $?)"
+          }
+          probe "對照 example.com  " https://example.com
+          probe "reserve 預設      " -A "$UA" https://reserve.tokyodisneyresort.jp/hotel/search/
+          probe "reserve 強制 IPv4 " -4 -A "$UA" https://reserve.tokyodisneyresort.jp/hotel/search/
+          probe "reserve 強制 IPv6 " -6 -A "$UA" https://reserve.tokyodisneyresort.jp/hotel/search/
+          probe "reserve HTTP/1.1  " --http1.1 -4 -A "$UA" https://reserve.tokyodisneyresort.jp/hotel/search/
+          probe "reserve 不帶 UA   " -4 https://reserve.tokyodisneyresort.jp/hotel/search/
+          probe "reserve 手機版 /sp/" -4 -A "$UA" https://reserve.tokyodisneyresort.jp/sp/hotel/search/
+          probe "排隊站 reserve-q  " -4 -A "$UA" https://reserve-q.tokyodisneyresort.jp/
+          probe "官網 www          " -4 -A "$UA" https://www.tokyodisneyresort.jp/
+          echo
+
+          echo "### 若有回應，看內容開頭"
+          curl -sS -L --max-time 25 -A "$UA" -4 \
+            https://reserve.tokyodisneyresort.jp/hotel/search/ 2>/dev/null \
+            | head -c 600 || echo "(沒有收到內容)"
+          echo
+
       # 診斷用：確認 runner 到底連不連得到官網。
       # Playwright 回報 url=about:blank，代表導覽完全沒開始，
       # 需要分辨是「網路層被丟包」還是「應用層擋下」。
       - name: Connectivity check
-        if: ${{ inputs.mode != 'scan' }}
+        if: ${{ inputs.mode == 'monitor' || inputs.mode == '' }}
         continue-on-error: true
         run: |
           echo "--- 對照組：一般網站 ---"
@@ -86,13 +154,13 @@ jobs:
           echo
 
       - name: Install Playwright
-        if: ${{ inputs.mode == 'scan' || steps.plan.outputs.browser == 'yes' }}
+        if: ${{ inputs.mode != 'diagnose' && (inputs.mode == 'scan' || steps.plan.outputs.browser == 'yes') }}
         run: |
           pip install playwright
           playwright install --with-deps chromium
 
       - name: Run monitor
-        if: ${{ inputs.mode != 'scan' }}
+        if: ${{ inputs.mode != 'scan' && inputs.mode != 'diagnose' }}
         env:
           LINE_CLIENT_ID: ${{ secrets.LINE_CLIENT_ID }}
           LINE_CLIENT_SECRET: ${{ secrets.LINE_CLIENT_SECRET }}
@@ -103,7 +171,7 @@ jobs:
       # 記住上一輪的空房狀態，這樣同一筆空房不會每輪重複通知。
       # 狀態沒變就不會寫檔，也就不會有多餘的 commit。
       - name: Persist monitor state
-        if: ${{ inputs.mode != 'scan' }}
+        if: ${{ inputs.mode != 'scan' && inputs.mode != 'diagnose' }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
