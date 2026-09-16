@@ -1,11 +1,13 @@
 name: Tokyo Disney Hotel Monitor (2027/01)
 
 on:
-  schedule:
-    # 每 3 小時查一次。區間是 31 天 x 2 間飯店，每小時跑對官網壓力太大、
-    # 也容易被反爬蟲盯上。未開賣的日期不會查，所以初期更輕。
-    # UTC 0 那輪 = JST 09:00，每日總覽就落在這一輪。
-    - cron: '0 */3 * * *'
+  # 2026/09/16 停用排程。實測 GitHub Actions 的 runner（Azure 機房 IP）
+  # 連不到官網：TCP 可以接上（connect 0.17s）但 30 秒內零位元組回應，
+  # 屬於接受連線後靜默丟棄。對照組 example.com 正常，確認不是程式問題。
+  # 繼續每 3 小時跑只是白耗，且一直對官網發請求，因此改為只保留手動觸發。
+  # 要恢復請把下面兩行解開註解。
+  # schedule:
+  #   - cron: '0 */3 * * *'
   workflow_dispatch:
     inputs:
       mode:
