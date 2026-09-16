@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>迪士尼空房快查</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --ink:#1a1d21; --muted:#6b7280;
+    --line:#e5e7eb; --open:#0b7a4b; --openbg:#e8f6ef;
+    --lock:#9ca3af; --lockbg:#f3f4f6; --accent:#1e4fd8;
+    padding-top:env(safe-area-inset-top,0px);
+    padding-bottom:env(safe-area-inset-bottom,0px);
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --bg:#14161a; --card:#1e2127; --ink:#e8eaed; --muted:#9aa0a6;
+      --line:#2e3238; --open:#4ade80; --openbg:#12321f;
+      --lock:#6b7280; --lockbg:#22262c; --accent:#7ba2ff;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC",sans-serif;
+       padding:16px;max-width:640px;margin-inline:auto}
+  h1{font-size:19px;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:16px}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;
+         padding:14px;margin-bottom:16px}
+  .panel h2{font-size:14px;margin:0 0 10px;color:var(--muted);font-weight:600}
+  .cd{display:flex;justify-content:space-between;gap:10px;padding:6px 0;
+      border-bottom:1px solid var(--line);font-size:14px}
+  .cd:last-child{border-bottom:0}
+  .cd b{font-weight:600}
+  .cd span{color:var(--muted);text-align:right;white-space:nowrap}
+  .row{background:var(--card);border:1px solid var(--line);border-radius:12px;
+       padding:12px 14px;margin-bottom:10px}
+  .row.locked{opacity:.55}
+  .rowtop{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:10px}
+  .date{font-size:16px;font-weight:600}
+  .tag{font-size:11px;padding:2px 8px;border-radius:99px;white-space:nowrap}
+  .tag.ok{color:var(--open);background:var(--openbg)}
+  .tag.no{color:var(--lock);background:var(--lockbg)}
+  .btns{display:flex;gap:8px;flex-wrap:wrap}
+  a.btn{flex:1 1 140px;text-align:center;text-decoration:none;padding:11px 8px;
+        border-radius:9px;background:var(--accent);color:#fff;font-size:14px;font-weight:600}
+  .row.locked a.btn{background:var(--lock);pointer-events:none}
+  .note{color:var(--muted);font-size:12.5px;margin-top:14px}
+  .note code{background:var(--lockbg);padding:1px 5px;border-radius:4px}
+</style>
+</head>
+<body>
+<h1>🏰 迪士尼空房快查</h1>
+<div class="sub">2 大人 / 1 房 / 1 晚 · 點按鈕直接開官網搜尋結果</div>
+
+<div class="panel">
+  <h2>目標日期開賣倒數</h2>
+  <div id="countdown"></div>
+</div>
+
+<div id="list"></div>
+
+<div class="note">
+  <p><b>開賣規則</b>：宿泊日的 4 個月前同日 11:00（日本時間），該月沒有同一天就順延到隔月 1 日。</p>
+  <p><b>看到排隊畫面是正常的</b>——官網忙碌時會導到 <code>reserve-q</code> 等候室，等它自動放行即可。</p>
+  <p>官網每天 <b>3:00~5:00 JST</b> 系統維護，不開放。</p>
+</div>
+
+<script>
+const HOTELS = [["FSH","泉鄉"],["DHM","海洋"]];
+const TARGETS = ["2027-01-29","2027-01-30","2027-01-31"];
+const WD = ["日","一","二","三","四","五","六"];
+const pad = n => String(n).padStart(2,"0");
+
+// 宿泊日 4 個月前同日 11:00 JST；該月無同日則順延到隔月 1 日
+function openAt(y,m,d){            // m: 1-12
+  let ty=y, tm=m-4;
+  while(tm<=0){ tm+=12; ty-=1; }
+  const dim = new Date(Date.UTC(ty,tm,0)).getUTCDate();   // 該月天數
+  if(d<=dim) return new Date(Date.UTC(ty,tm-1,d,2,0));     // 11:00 JST = 02:00 UTC
+  let ny=ty, nm=tm+1;
+  if(nm>12){ nm=1; ny+=1; }
+  return new Date(Date.UTC(ny,nm-1,1,2,0));
+}
+
+function url(code,y,m,d){
+  const p = new URLSearchParams({
+    showWay:"", roomsNum:"1", adultNum:"2", childNum:"0", stayingDays:"1",
+    useDate:`${y}${pad(m)}${pad(d)}`, cpListStr:"", childAgeBedInform:"",
+    searchHotelCD:code, searchHotelDiv:"", hotelName:"", searchHotelName:"",
+    searchLayer:"", searchRoomName:"", hotelSearchDetail:"true", detailOpenFlg:"0",
+    checkPointStr:"", hotelChangeFlg:"false", removeSessionFlg:"true",
+    returnFlg:"false", hotelShowFlg:"", displayType:"data-hotel", reservationStatus:"1"
+  });
+  return "https://reserve.tokyodisneyresort.jp/hotel/list/?"+p.toString();
+}
+
+function until(ms){
+  if(ms<=0) return "已開賣";
+  const t=Math.floor(ms/1000), d=Math.floor(t/86400),
+        h=Math.floor(t%86400/3600), mi=Math.floor(t%3600/60);
+  if(d) return `還有 ${d} 天 ${h} 小時`;
+  if(h) return `還有 ${h} 小時 ${mi} 分`;
+  return `還有 ${mi} 分`;
+}
+
+function jstLabel(dt){
+  const j = new Date(dt.getTime()+9*3600e3);
+  return `${pad(j.getUTCMonth()+1)}/${pad(j.getUTCDate())} ${pad(j.getUTCHours())}:${pad(j.getUTCMinutes())} JST`;
+}
+
+function render(){
+  const now = new Date();
+
+  document.getElementById("countdown").innerHTML = TARGETS.map(s=>{
+    const [y,m,d]=s.split("-").map(Number);
+    const o=openAt(y,m,d), wd=WD[new Date(Date.UTC(y,m-1,d)).getUTCDay()];
+    return `<div class="cd"><b>${m}/${d}(${wd})</b>
+            <span>${jstLabel(o)}　${until(o-now)}</span></div>`;
+  }).join("");
+
+  let html="";
+  for(let d=1; d<=31; d++){
+    const o=openAt(2027,1,d), isOpen = now>=o;
+    const wd=WD[new Date(Date.UTC(2027,0,d)).getUTCDay()];
+    const star = TARGETS.includes(`2027-01-${pad(d)}`) ? " ★" : "";
+    html += `<div class="row${isOpen?"":" locked"}">
+      <div class="rowtop">
+        <span class="date">01/${pad(d)}(${wd})${star}</span>
+        <span class="tag ${isOpen?"ok":"no"}">${isOpen?"可查":jstLabel(o)+" 開賣"}</span>
+      </div>
+      <div class="btns">${HOTELS.map(([c,n])=>
+        `<a class="btn" href="${url(c,2027,1,d)}" target="_blank" rel="noopener">${n}</a>`
+      ).join("")}</div></div>`;
+  }
+  document.getElementById("list").innerHTML = html;
+}
+
+render();
+setInterval(render, 60000);
+</script>
+</body>
+</html>

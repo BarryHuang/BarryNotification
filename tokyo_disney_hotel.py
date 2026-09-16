@@ -993,13 +993,49 @@ def main():
         print("Skipping LINE broadcast as tokens are not configured.")
 
 
+def run_urls(argv):
+    """--urls：印出可直接在手機上使用的查詢網址。
+
+    給「手機一鍵查詢」用：HTTP Shortcuts 之類的 App 只要照這些網址
+    發請求即可，不需要 Python 或瀏覽器自動化。
+    """
+    def arg(name, default):
+        return argv[argv.index(name) + 1] if name in argv else default
+
+    dates_raw = arg("--dates", "")
+    codes = arg("--hotels", ",".join(MONITOR_HOTELS)).split(",")
+    nights = int(arg("--nights", "1"))
+
+    if dates_raw:
+        dates = [datetime.datetime.strptime(d, "%Y-%m-%d").date()
+                 for d in dates_raw.split(",")]
+    else:
+        dates = open_target_dates(datetime.datetime.now(tz=JST))
+
+    now = datetime.datetime.now(tz=JST)
+    hotel_names = dict(HOTELS)
+    print(f"共 {len(dates) * len(codes)} 個網址"
+          f"（{len(dates)} 個日期 x {len(codes)} 間飯店，每次 {nights} 晚，"
+          f"{ADULT_NUM} 大人 / {ROOMS_NUM} 房）\n")
+    for d in dates:
+        open_at = reservation_open_at(d)
+        state = "可查" if now >= open_at else f"未開賣（{open_at:%m/%d %H:%M} JST 開）"
+        print(f"== {d} ({WEEKDAY_TW[d.weekday()]})  {state} ==")
+        for cd in codes:
+            print(f"  {cd} {hotel_names.get(cd, cd)}")
+            print(f"  {build_search_url(cd, d, nights)}")
+        print()
+
+
 def needs_browser():
     """給 workflow 用：這一輪到底需不需要開瀏覽器。"""
     return bool(open_target_dates(datetime.datetime.now(tz=JST)))
 
 
 if __name__ == "__main__":
-    if "--needs-browser" in sys.argv:
+    if "--urls" in sys.argv:
+        run_urls(sys.argv)
+    elif "--needs-browser" in sys.argv:
         print("yes" if needs_browser() else "no")
     elif "--scan" in sys.argv:
         run_scan(sys.argv)
