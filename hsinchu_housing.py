@@ -152,12 +152,34 @@ def med(vals):
     return round(statistics.median(vals), 1)
 
 
-def collect_resale(seasons):
+def dedupe(rows):
+    """同一件編號以最後出現的為準：本期檔排在季別檔後面，修正過的版本會蓋掉舊的。"""
+    out, idx = [], {}
+    for d in rows:
+        k = d["編號"]
+        if not k:
+            out.append(d)
+        elif k in idx:
+            out[idx[k]] = d
+        else:
+            idx[k] = len(out)
+            out.append(d)
+    return out
+
+
+def batches_of(code, kind, seasons, extra):
+    """季別歷史檔 + 本期檔。本期資料掛在當季名下，等該季的季檔生成後會自然接上。"""
+    out = [(s, fetch(code, s, kind)) for s in seasons]
+    out.append((recent_seasons(1)[0], (extra or {}).get((code, kind), [])))
+    return out
+
+
+def collect_resale(seasons, extra=None):
     out, skipped = [], 0
     codes = {cfg["code"] for cfg in REGIONS.values()}
     for code in sorted(codes):
-        for s in seasons:
-            for r in fetch(code, s, "A"):
+        for s, rows in batches_of(code, "A", seasons, extra):
+            for r in rows:
                 addr = r.get("土地位置建物門牌") or ""
                 region, road = classify(addr)
                 if not region:
@@ -193,16 +215,17 @@ def collect_resale(seasons):
                     "屋齡": age, "完工年月": built, "車位": r.get("車位類別", ""),
                     "備註": (r.get("備註") or "")[:60],
                 })
+    out = dedupe(out)
     out.sort(key=lambda x: (x["區域"], x["成交日"] or ""), reverse=False)
     return out, skipped
 
 
-def collect_presale(seasons):
+def collect_presale(seasons, extra=None):
     out = []
     codes = {cfg["code"] for cfg in REGIONS.values()}
     for code in sorted(codes):
-        for s in seasons:
-            for r in fetch(code, s, "B"):
+        for s, rows in batches_of(code, "B", seasons, extra):
+            for r in rows:
                 addr = r.get("土地位置建物門牌") or ""
                 region, road = classify(addr)
                 if not region:
@@ -228,6 +251,7 @@ def collect_presale(seasons):
                     "坪數": round(float(r.get("建物移轉總面積平方公尺") or 0) / PING, 1),
                     "總價萬": round(total / 10000), "單價萬每坪": unit_price(r) or "",
                 })
+    out = dedupe(out)
     out.sort(key=lambda x: (x["區域"], x["成交日"] or ""))
     return out
 
@@ -254,6 +278,7 @@ OUT_DIR = os.path.join(HERE, "docs")
 DATA_DIR = os.path.join(OUT_DIR, "data")
 STATE_PATH = os.path.join(DATA_DIR, "seen.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "history.json")
+SOURCE_PATH = os.path.join(DATA_DIR, "source.json")   # 記住上次抓成功的本期端點
 HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "60"))
 # 實價登錄申報後約 30 天才揭露，最新成交日正常落後 10~40 天；超過這個天數視為來源停更
 STALE_DAYS = int(os.environ.get("STALE_DAYS", "45"))
@@ -788,6 +813,115 @@ def build_message(new_resale, new_presale, resale, baseline=False, fresh=(None, 
 
 
 # =====================================================================
+#  本期下載：每月 1、11、21 日更新的最近一期
+#
+#  季別歷史檔（DownloadSeason）要整季結束才生成，季中只靠季檔會完全抓不到
+#  新揭露——這正是報表從 8/29 起天天「無新成交」的原因。本期檔的網址官方
+#  沒有文件，所以這裡不寫死：先用上次成功的網址，失敗才掃候選清單、再不行
+#  就去下載頁把連結挖出來；每個候選都要通過驗證（解得開、含我們要的縣市檔、
+#  有交易年月日）才算數，成功後把網址記進 docs/data/source.json。
+# =====================================================================
+
+CURRENT_CANDIDATES = [
+    "https://plvr.land.moi.gov.tw/Download?type=zip&fileName=lvr_landcsv.zip",
+    "https://plvr.land.moi.gov.tw/Download?fileName=lvr_landcsv.zip",
+    "https://plvr.land.moi.gov.tw/DownloadSeason?type=zip&fileName=lvr_landcsv.zip",
+    "https://plvr.land.moi.gov.tw/DownloadHistory?type=zip&fileName=lvr_landcsv.zip",
+]
+
+
+def _unpack_current(data):
+    """驗證並解開本期 zip，回傳 {(縣市代號, 檔別): 原始列}；不合格回 {}。"""
+    if data[:2] != b"PK":
+        return {}
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data))
+    except Exception:
+        return {}
+    names = set(z.namelist())
+    out = {}
+    for code in sorted({cfg["code"] for cfg in REGIONS.values()}):
+        for kind in ("A", "B"):
+            n = "%s_lvr_land_%s.csv" % (code, kind)
+            if n not in names:
+                continue
+            try:
+                rows = parse_lvr_csv(z.read(n))
+            except Exception as e:
+                print("  · 本期檔裡的 %s 解析失敗: %s" % (n, e))
+                continue
+            if rows and any(r.get("交易年月日") for r in rows):
+                out[(code, kind)] = rows
+    return out
+
+
+def _page_candidates():
+    """官方沒有文件，從下載頁把 lvr_landcsv.zip 的連結挖出來當候選。"""
+    _, _, data = _get(OPENDATA_PAGE, timeout=30)
+    if not data:
+        return []
+    text = data.decode("utf-8", "replace")
+    hits = re.findall(r"""['"]([^'"\s]*[Dd]ownload[^'"\s]*lvr_landcsv\.zip[^'"\s]*)['"]""", text)
+    return list(dict.fromkeys(urllib.parse.urljoin(OPENDATA_PAGE, h) for h in hits))
+
+
+def load_source():
+    try:
+        with open(SOURCE_PATH, encoding="utf-8") as f:
+            return json.load(f).get("url") or None
+    except Exception:
+        return None
+
+
+def save_source(url):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(SOURCE_PATH, "w", encoding="utf-8") as f:
+        json.dump({"url": url, "updated": datetime.date.today().isoformat()},
+                  f, ensure_ascii=False, indent=1)
+
+
+def fetch_current():
+    """回傳本期資料 {(縣市代號, 檔別): 原始列}；全部端點都不行時回 {}。"""
+    remembered = load_source()
+
+    def attempts():
+        if remembered:
+            yield remembered
+        for u in CURRENT_CANDIDATES:
+            yield u
+        for u in _page_candidates():   # 前面都不行才會走到這裡，平常不會多打一次
+            yield u
+
+    tried = set()
+    for url in attempts():
+        if url in tried:
+            continue
+        tried.add(url)
+        code, ctype, data = _get(url)
+        if code is None:
+            print("  · 本期檔 %s 連不上: %s" % (url, ctype))
+            continue
+        got = _unpack_current(data)
+        if not got:
+            print("  · 本期檔 %s 回 %s %s %d bytes，不是預期的資料"
+                  % (url, code, ctype, len(data)))
+            continue
+        n = sum(len(v) for v in got.values())
+        ds = sorted(r.get("交易年月日", "") for v in got.values()
+                    for r in v if r.get("交易年月日"))
+        print("  ✓ 本期檔 %s：%s 共 %d 筆，交易年月日 %s ~ %s"
+              % (url, "／".join("%s_%s" % k for k in sorted(got)), n, ds[0], ds[-1]))
+        FETCH_LOG.append(("本期", "ok", len(data), n))
+        if url != remembered:
+            save_source(url)
+        return got
+
+    print("  ! 本期檔所有端點都失敗，只剩季別歷史檔（季中不會更新）。", file=sys.stderr)
+    FETCH_LOG.append(("本期", "全部失敗", 0, 0))
+    return {}
+
+
+# =====================================================================
 #  --probe：探測內政部開放資料的下載端點
 #
 #  季別歷史檔（DownloadSeason）在季中不會更新，每月 1/11/21 的新揭露是放在
@@ -893,10 +1027,13 @@ def main():
     seasons = args or recent_seasons()
     print("期間：%s" % ", ".join(seasons))
 
-    resale, skipped = collect_resale(seasons)
-    presale = collect_presale(seasons)
+    # 季別檔只到上一季，當季的新揭露要靠本期檔
+    extra = fetch_current()
+
+    resale, skipped = collect_resale(seasons, extra)
+    presale = collect_presale(seasons, extra)
     # 預售登錄早於完工數年，取更長的期間才對得到建案名稱
-    name_idx = build_name_index(collect_presale(recent_seasons(NAME_SEASONS)))
+    name_idx = build_name_index(collect_presale(recent_seasons(NAME_SEASONS), extra))
     print("成屋 %d 筆、預售 %d 筆（另 %d 筆缺完工年月）" % (len(resale), len(presale), skipped))
 
     empty = sorted({t for t, st, _, _ in FETCH_LOG if st != "ok"})
