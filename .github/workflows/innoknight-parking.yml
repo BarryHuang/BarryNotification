@@ -1,0 +1,83 @@
+name: InnoKnight 車位監控
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '執行模式'
+        type: choice
+        options:
+          - probe
+          - monitor
+        default: probe
+      keyword:
+        description: '車位查詢 keyword（留空=用預設）'
+        type: string
+        default: ''
+  # API 接好之後把下面解開就會自動跑
+  # schedule:
+  #   - cron: '*/15 * * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: innoknight-parking
+  cancel-in-progress: false
+
+jobs:
+  check-parking:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 先確認 runner 連不連得到目標站，跟一般網站做對照
+      - name: Connectivity check
+        continue-on-error: true
+        run: |
+          echo "--- 對照組 ---"
+          curl -sS -o /dev/null --max-time 20 \
+            -w 'example.com  http=%{http_code} connect=%{time_connect}s total=%{time_total}s\n' \
+            https://example.com || echo "example.com 失敗 (exit $?)"
+          echo "--- 目標站 ---"
+          curl -sS -o /dev/null --max-time 30 \
+            -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' \
+            -w 'iot.innoknight.com  http=%{http_code} ip=%{remote_ip} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s size=%{size_download}\n' \
+            https://iot.innoknight.com/ || echo "目標站失敗 (exit $?)"
+
+      - name: Probe API
+        if: ${{ inputs.mode == 'probe' || inputs.mode == '' }}
+        env:
+          INNOKNIGHT_KEYWORD: ${{ inputs.keyword }}
+        run: |
+          python innoknight_parking.py --probe
+
+      - name: Run monitor
+        if: ${{ inputs.mode == 'monitor' }}
+        env:
+          INNOKNIGHT_KEYWORD: ${{ inputs.keyword }}
+          LINE_CLIENT_ID: ${{ secrets.LINE_CLIENT_ID }}
+          LINE_CLIENT_SECRET: ${{ secrets.LINE_CLIENT_SECRET }}
+        run: |
+          python innoknight_parking.py
+
+      - name: Persist monitor state
+        if: ${{ inputs.mode == 'monitor' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/data/parking_seen.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "狀態無變動，不需 commit。"
+          else
+            git commit -m "更新車位監控狀態 $(date -u +'%Y-%m-%dT%H:%MZ')"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
