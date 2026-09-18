@@ -27,7 +27,8 @@ import urllib.error
 
 # === Config ===
 SITE = "https://iot.innoknight.com"
-KEYWORD = os.environ.get("INNOKNIGHT_KEYWORD", "jLcQ1nLbk96Qz2g7n0FNJA==")
+# workflow 的 keyword 欄位留空時傳進來是空字串，不是沒設，所以要用 or 擋掉
+KEYWORD = os.environ.get("INNOKNIGHT_KEYWORD") or "jLcQ1nLbk96Qz2g7n0FNJA=="
 PAGE_URL = f"{SITE}/#/search/devices?keyword={urllib.parse.quote(KEYWORD, safe='')}"
 
 STATE_FILE = os.path.join("docs", "data", "parking_seen.json")
@@ -210,23 +211,28 @@ def probe():
 
 
 
-# === Probe（瀏覽器）：用真實 Chromium 開頁面，側錄它打的每一支 API ===
 
-def probe_browser(out_dir="probe_out"):
-    """SPA 的資料一定是前端自己去要的。與其猜端點，不如開一顆瀏覽器把
-    頁面載完，把所有 XHR / fetch 的網址、payload、回應原封不動印出來。
-    順便把渲染完的畫面文字與截圖留下來，就算 API 看不懂也還有 DOM 可解析。"""
+# === 用真實瀏覽器載入頁面，並側錄它打的每一支 API ===
+
+def render_page(out_dir=None, settle_ms=6000):
+    """開一顆 Chromium 把 SPA 載完。
+
+    回傳 (calls, text, html)：
+      calls — 所有 XHR/fetch 的網址、payload、回應原文
+      text  — 渲染完成後畫面上的文字（DOM 備援解析用）
+      html  — 渲染完成後的 HTML
+
+    SPA 的資料一定是前端自己去要的，與其猜端點，不如把瀏覽器實際發出的請求
+    原封不動收下來。就算 API 欄位看不懂，畫面文字也還能當第二條解析路徑。
+    """
     from playwright.sync_api import sync_playwright
 
-    os.makedirs(out_dir, exist_ok=True)
     calls = []
+    text = ""
+    html = ""
 
-    print("=" * 70)
-    print(f"用瀏覽器開：{PAGE_URL}")
-    print("=" * 70)
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(args=["--disable-gpu", "--no-sandbox"])
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(args=["--disable-gpu", "--no-sandbox"])
         page = browser.new_page(
             user_agent=BROWSER_UA,
             viewport={"width": 430, "height": 900},
@@ -237,7 +243,11 @@ def probe_browser(out_dir="probe_out"):
             req = resp.request
             if req.resource_type not in ("xhr", "fetch"):
                 return
-            entry = {
+            try:
+                body = resp.text()
+            except Exception as e:
+                body = f"(讀不到 body: {e})"
+            calls.append({
                 "method": req.method,
                 "url": req.url,
                 "status": resp.status,
@@ -248,13 +258,8 @@ def probe_browser(out_dir="probe_out"):
                                      "token", "referer", "origin", "accept")
                 },
                 "resp_content_type": resp.headers.get("content-type", ""),
-            }
-            try:
-                body = resp.text()
-            except Exception as e:
-                body = f"(讀不到 body: {e})"
-            entry["body"] = body
-            calls.append(entry)
+                "body": body,
+            })
 
         page.on("response", on_response)
 
@@ -262,51 +267,208 @@ def probe_browser(out_dir="probe_out"):
             page.goto(PAGE_URL, wait_until="networkidle", timeout=60000)
         except Exception as e:
             print(f"  goto 逾時或失敗：{type(e).__name__}: {e}（仍繼續看已載到的東西）")
-        page.wait_for_timeout(6000)
+        page.wait_for_timeout(settle_ms)
 
-        print(f"\n### 最終網址：{page.url}")
+        final_url = page.url
         try:
-            print(f"### 標題：{page.title()}")
+            title = page.title()
         except Exception:
-            pass
-
-        print(f"\n### 側錄到 {len(calls)} 支 XHR/fetch")
-        for i, c in enumerate(calls, 1):
-            print(f"\n  --- [{i}] {c['method']} {c['url']}")
-            print(f"      status={c['status']}  content-type={c['resp_content_type']}")
-            if c["req_headers"]:
-                print(f"      req headers: {json.dumps(c['req_headers'], ensure_ascii=False)}")
-            if c["post_data"]:
-                print(f"      post data  : {c['post_data'][:800]}")
-            body = c["body"] or ""
-            print(f"      body ({len(body)} chars):")
-            print("        " + body[:3000].replace("\n", "\n        "))
-
-        with open(os.path.join(out_dir, "xhr.json"), "w", encoding="utf-8") as f:
-            json.dump(calls, f, ensure_ascii=False, indent=2)
-
+            title = ""
         try:
             text = page.inner_text("body")
         except Exception as e:
             text = f"(取不到 body 文字: {e})"
-        print(f"\n### 渲染後的畫面文字（{len(text)} 字）")
-        print("  " + text[:4000].replace("\n", "\n  "))
-        with open(os.path.join(out_dir, "page.txt"), "w", encoding="utf-8") as f:
-            f.write(text)
-
-        html = page.content()
-        with open(os.path.join(out_dir, "page.html"), "w", encoding="utf-8") as f:
-            f.write(html)
-
         try:
-            page.screenshot(path=os.path.join(out_dir, "page.png"), full_page=True)
-            print(f"\n### 截圖已存到 {out_dir}/page.png")
-        except Exception as e:
-            print(f"\n### 截圖失敗：{e}")
+            html = page.content()
+        except Exception:
+            html = ""
+
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, "xhr.json"), "w", encoding="utf-8") as f:
+                json.dump(calls, f, ensure_ascii=False, indent=2)
+            with open(os.path.join(out_dir, "page.txt"), "w", encoding="utf-8") as f:
+                f.write(text)
+            with open(os.path.join(out_dir, "page.html"), "w", encoding="utf-8") as f:
+                f.write(html)
+            try:
+                page.screenshot(path=os.path.join(out_dir, "page.png"), full_page=True)
+            except Exception as e:
+                print(f"  截圖失敗：{e}")
 
         browser.close()
 
-    print("\n瀏覽器探測結束。xhr.json / page.txt / page.html / page.png 會上傳成 artifact。")
+    print(f"  最終網址：{final_url}")
+    if title:
+        print(f"  標題：{title}")
+    return calls, text, html
+
+
+def probe_browser(out_dir="probe_out"):
+    print("=" * 70)
+    print(f"用瀏覽器開：{PAGE_URL}")
+    print("=" * 70)
+
+    calls, text, _ = render_page(out_dir=out_dir)
+
+    print(f"\n### 側錄到 {len(calls)} 支 XHR/fetch")
+    for i, c in enumerate(calls, 1):
+        print(f"\n  --- [{i}] {c['method']} {c['url']}")
+        print(f"      status={c['status']}  content-type={c['resp_content_type']}")
+        if c["req_headers"]:
+            print(f"      req headers: {json.dumps(c['req_headers'], ensure_ascii=False)}")
+        if c["post_data"]:
+            print(f"      post data  : {c['post_data'][:800]}")
+        body = c["body"] or ""
+        print(f"      body ({len(body)} chars):")
+        print("        " + body[:3000].replace("\n", "\n        "))
+
+    print(f"\n### 渲染後的畫面文字（{len(text)} 字）")
+    print("  " + text[:4000].replace("\n", "\n  "))
+
+    print("\n### 自動判讀結果（正式監控會用這套邏輯）")
+    devices = extract_devices(calls, text)
+    report_devices(devices)
+
+    print(f"\n探測結束。{out_dir}/ 下的 xhr.json / page.txt / page.html / page.png 會上傳成 artifact。")
+
+
+# === 判讀車位狀態 ===
+
+# 一筆「裝置」至少要有個看得出是誰的欄位，以及一個看得出狀態的欄位
+NAME_KEYS = ("devicename", "devname", "device_name", "name", "title", "label",
+             "sn", "deviceid", "device_id", "devid", "deveui", "alias", "nickname")
+STATUS_KEYS = ("status", "state", "value", "occupied", "isoccupied", "occupy",
+               "parkingstatus", "parking_status", "carstatus", "car_status",
+               "detect", "detected", "presence", "online", "data", "lastvalue",
+               "last_value", "payload")
+
+VACANT_WORDS = ("空位", "空車位", "空閒", "空", "可用", "未使用", "無車", "沒車",
+                "vacant", "free", "available", "empty", "idle", "unoccupied")
+OCCUPIED_WORDS = ("已佔用", "占用", "佔用", "使用中", "有車", "已停", "已滿", "滿",
+                  "occupied", "busy", "in use", "inuse", "taken", "full")
+
+
+def _norm(v):
+    return str(v).strip().lower()
+
+
+def classify_status(device):
+    """回傳 'vacant' / 'occupied' / 'unknown'，以及當初判斷依據的原始文字。
+
+    先看文字關鍵字，再退回布林/數字慣例（多數車位感測器用 1=有車、0=沒車）。
+    """
+    for key, val in device.get("_status_fields", {}).items():
+        text = _norm(val)
+        if not text:
+            continue
+        # 文字關鍵字：佔用先判，因為「已佔用」也含有「用」這類字
+        for w in OCCUPIED_WORDS:
+            if w in text:
+                return "occupied", f"{key}={val}"
+        for w in VACANT_WORDS:
+            if w in text:
+                return "vacant", f"{key}={val}"
+
+    for key, val in device.get("_status_fields", {}).items():
+        lk = key.lower()
+        if lk in ("occupied", "isoccupied", "occupy", "detected", "presence",
+                  "carstatus", "car_status", "parkingstatus", "parking_status"):
+            if isinstance(val, bool):
+                return ("occupied" if val else "vacant"), f"{key}={val}"
+            if isinstance(val, (int, float)) or _norm(val) in ("0", "1"):
+                try:
+                    n = float(val)
+                except (TypeError, ValueError):
+                    continue
+                return ("occupied" if n else "vacant"), f"{key}={val}"
+
+    return "unknown", ""
+
+
+def _walk(obj, hits):
+    """在任意 JSON 結構裡找出長得像「裝置」的字典。"""
+    if isinstance(obj, dict):
+        keys = {k.lower(): k for k in obj.keys()}
+        name_key = next((keys[k] for k in NAME_KEYS if k in keys), None)
+        status_fields = {keys[k]: obj[keys[k]] for k in STATUS_KEYS if k in keys}
+        # data / payload 常是巢狀物件，本身不算狀態值
+        scalar_status = {
+            k: v for k, v in status_fields.items()
+            if not isinstance(v, (dict, list))
+        }
+        if name_key and scalar_status:
+            hits.append({
+                "name": str(obj[name_key]),
+                "_status_fields": scalar_status,
+                "_raw": obj,
+            })
+        for v in obj.values():
+            _walk(v, hits)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk(v, hits)
+
+
+def extract_devices(calls, page_text=""):
+    """從側錄到的 API 回應裡抽出車位清單；抽不到就退回解析畫面文字。"""
+    devices = []
+    seen_names = set()
+
+    for c in calls:
+        body = c.get("body") or ""
+        ct = (c.get("resp_content_type") or "").lower()
+        if "json" not in ct and not body.lstrip().startswith(("{", "[")):
+            continue
+        try:
+            data = json.loads(body)
+        except Exception:
+            continue
+        hits = []
+        _walk(data, hits)
+        for h in hits:
+            if h["name"] in seen_names:
+                continue
+            seen_names.add(h["name"])
+            status, why = classify_status(h)
+            devices.append({
+                "name": h["name"],
+                "status": status,
+                "why": why,
+                "source": c["url"],
+                "fields": h["_status_fields"],
+            })
+
+    if devices:
+        return devices
+
+    # 備援：API 沒認出來的話，看畫面上一行一行的文字
+    for line in (page_text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if any(w in low for w in OCCUPIED_WORDS):
+            devices.append({"name": line, "status": "occupied", "why": "畫面文字",
+                            "source": "DOM", "fields": {}})
+        elif any(w in low for w in VACANT_WORDS):
+            devices.append({"name": line, "status": "vacant", "why": "畫面文字",
+                            "source": "DOM", "fields": {}})
+    return devices
+
+
+def report_devices(devices):
+    if not devices:
+        print("  沒有辨識出任何車位。API 欄位可能跟預期不同，請看上面的原始回應。")
+        return
+    for d in devices:
+        icon = {"vacant": "🟢", "occupied": "🔴"}.get(d["status"], "⚪")
+        fields = json.dumps(d["fields"], ensure_ascii=False) if d["fields"] else ""
+        print(f"  {icon} {d['name']}  status={d['status']}  依據={d['why'] or '—'}  {fields}")
+    vacant = [d for d in devices if d["status"] == "vacant"]
+    unknown = [d for d in devices if d["status"] == "unknown"]
+    print(f"  合計 {len(devices)} 個車位：空 {len(vacant)}、"
+          f"佔用 {len(devices) - len(vacant) - len(unknown)}、無法判讀 {len(unknown)}")
 
 
 # === 狀態記錄（避免同一批空位一直重複通知）===
@@ -326,6 +488,84 @@ def save_state(state):
         f.write("\n")
 
 
+# === 監控 ===
+
+def run_monitor(force_notify=False):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    taipei = now + datetime.timedelta(hours=8)
+    stamp = taipei.strftime("%Y-%m-%d %H:%M")
+
+    print(f"檢查時間：{stamp} (台灣時間)")
+    calls, text, _ = render_page()
+    print(f"  側錄到 {len(calls)} 支 XHR/fetch，畫面文字 {len(text)} 字")
+
+    devices = extract_devices(calls, text)
+    report_devices(devices)
+
+    if not devices:
+        print("判讀不到車位，這一輪不通知也不更新狀態，避免用壞掉的資料蓋掉紀錄。")
+        for c in calls:
+            print(f"  [debug] {c['method']} {c['url']} -> {c['status']} "
+                  f"{(c.get('body') or '')[:200]}")
+        if force_notify:
+            token = get_line_token()
+            if token:
+                send_line_broadcast(
+                    token,
+                    f"⚠️ 車位監控判讀失敗\n"
+                    f"📅 {stamp}\n"
+                    f"頁面載得到，但認不出車位欄位，請看 GitHub Actions log。\n"
+                    f"🔗 {PAGE_URL}"
+                )
+        return 0
+
+    vacant = sorted(d["name"] for d in devices if d["status"] == "vacant")
+    state = load_state()
+    prev_vacant = set(state.get("vacant", []))
+    newly = [n for n in vacant if n not in prev_vacant]
+
+    state["vacant"] = vacant
+    state["checked_at"] = taipei.strftime("%Y-%m-%dT%H:%M+08:00")
+    state["total"] = len(devices)
+    save_state(state)
+
+    if not vacant:
+        print("目前沒有空位。")
+        if not force_notify:
+            return 0
+    elif not newly and not force_notify:
+        print(f"有 {len(vacant)} 個空位，但都是上一輪就通知過的，這輪不重複發。")
+        return 0
+
+    lines = []
+    for d in devices:
+        icon = {"vacant": "🟢 空位", "occupied": "🔴 已佔用"}.get(d["status"], "⚪ 未知")
+        mark = "  ← 新空出來" if d["name"] in newly else ""
+        lines.append(f"  {icon}　{d['name']}{mark}")
+
+    headline = (
+        f"🅿️ 有 {len(vacant)} 個空車位！" if vacant else "🅿️ 目前沒有空車位"
+    )
+    body = (
+        f"{headline}\n"
+        f"📅 {stamp}（台灣時間）\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(lines) + "\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔗 {PAGE_URL}\n"
+        f"🤖 此為自動化播報服務 (GitHub Actions)"
+    )
+    print("通知內容：")
+    print(body)
+
+    token = get_line_token()
+    if token:
+        send_line_broadcast(token, body)
+    else:
+        print("沒有 LINE 憑證，略過廣播。")
+    return 0
+
+
 # === Main ===
 
 def main(argv):
@@ -337,9 +577,7 @@ def main(argv):
         probe()
         return 0
 
-    print("正式監控模式尚未接上 API：請先跑 --probe 找出端點。")
-    print(f"頁面：{PAGE_URL}")
-    return 0
+    return run_monitor(force_notify="--force-notify" in argv)
 
 
 if __name__ == "__main__":
