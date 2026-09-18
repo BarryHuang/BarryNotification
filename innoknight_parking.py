@@ -8,7 +8,8 @@
 前端 bundle 撈下來、找出真正的 API 端點，確認格式後再接成正式監控。
 
 用法：
-    python innoknight_parking.py --probe      # 探測 API（只印 log，不發 LINE）
+    python innoknight_parking.py --probe-browser  # 用瀏覽器側錄真正的 API（推薦）
+    python innoknight_parking.py --probe      # 純 HTTP 探測（不需 Playwright）
     python innoknight_parking.py              # 正式監控（有空位就發 LINE）
     python innoknight_parking.py --force-notify   # 不管有沒有空位都發一則
 """
@@ -208,6 +209,106 @@ def probe():
     print("\n探測結束。把上面 <<< 標記的端點或 bundle 裡的 API 路徑貼回來，就能接成正式監控。")
 
 
+
+# === Probe（瀏覽器）：用真實 Chromium 開頁面，側錄它打的每一支 API ===
+
+def probe_browser(out_dir="probe_out"):
+    """SPA 的資料一定是前端自己去要的。與其猜端點，不如開一顆瀏覽器把
+    頁面載完，把所有 XHR / fetch 的網址、payload、回應原封不動印出來。
+    順便把渲染完的畫面文字與截圖留下來，就算 API 看不懂也還有 DOM 可解析。"""
+    from playwright.sync_api import sync_playwright
+
+    os.makedirs(out_dir, exist_ok=True)
+    calls = []
+
+    print("=" * 70)
+    print(f"用瀏覽器開：{PAGE_URL}")
+    print("=" * 70)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(args=["--disable-gpu", "--no-sandbox"])
+        page = browser.new_page(
+            user_agent=BROWSER_UA,
+            viewport={"width": 430, "height": 900},
+            locale="zh-TW",
+        )
+
+        def on_response(resp):
+            req = resp.request
+            if req.resource_type not in ("xhr", "fetch"):
+                return
+            entry = {
+                "method": req.method,
+                "url": req.url,
+                "status": resp.status,
+                "post_data": req.post_data,
+                "req_headers": {
+                    k: v for k, v in req.headers.items()
+                    if k.lower() in ("content-type", "authorization", "x-token",
+                                     "token", "referer", "origin", "accept")
+                },
+                "resp_content_type": resp.headers.get("content-type", ""),
+            }
+            try:
+                body = resp.text()
+            except Exception as e:
+                body = f"(讀不到 body: {e})"
+            entry["body"] = body
+            calls.append(entry)
+
+        page.on("response", on_response)
+
+        try:
+            page.goto(PAGE_URL, wait_until="networkidle", timeout=60000)
+        except Exception as e:
+            print(f"  goto 逾時或失敗：{type(e).__name__}: {e}（仍繼續看已載到的東西）")
+        page.wait_for_timeout(6000)
+
+        print(f"\n### 最終網址：{page.url}")
+        try:
+            print(f"### 標題：{page.title()}")
+        except Exception:
+            pass
+
+        print(f"\n### 側錄到 {len(calls)} 支 XHR/fetch")
+        for i, c in enumerate(calls, 1):
+            print(f"\n  --- [{i}] {c['method']} {c['url']}")
+            print(f"      status={c['status']}  content-type={c['resp_content_type']}")
+            if c["req_headers"]:
+                print(f"      req headers: {json.dumps(c['req_headers'], ensure_ascii=False)}")
+            if c["post_data"]:
+                print(f"      post data  : {c['post_data'][:800]}")
+            body = c["body"] or ""
+            print(f"      body ({len(body)} chars):")
+            print("        " + body[:3000].replace("\n", "\n        "))
+
+        with open(os.path.join(out_dir, "xhr.json"), "w", encoding="utf-8") as f:
+            json.dump(calls, f, ensure_ascii=False, indent=2)
+
+        try:
+            text = page.inner_text("body")
+        except Exception as e:
+            text = f"(取不到 body 文字: {e})"
+        print(f"\n### 渲染後的畫面文字（{len(text)} 字）")
+        print("  " + text[:4000].replace("\n", "\n  "))
+        with open(os.path.join(out_dir, "page.txt"), "w", encoding="utf-8") as f:
+            f.write(text)
+
+        html = page.content()
+        with open(os.path.join(out_dir, "page.html"), "w", encoding="utf-8") as f:
+            f.write(html)
+
+        try:
+            page.screenshot(path=os.path.join(out_dir, "page.png"), full_page=True)
+            print(f"\n### 截圖已存到 {out_dir}/page.png")
+        except Exception as e:
+            print(f"\n### 截圖失敗：{e}")
+
+        browser.close()
+
+    print("\n瀏覽器探測結束。xhr.json / page.txt / page.html / page.png 會上傳成 artifact。")
+
+
 # === 狀態記錄（避免同一批空位一直重複通知）===
 
 def load_state():
@@ -228,6 +329,10 @@ def save_state(state):
 # === Main ===
 
 def main(argv):
+    if "--probe-browser" in argv:
+        probe_browser()
+        return 0
+
     if "--probe" in argv:
         probe()
         return 0
