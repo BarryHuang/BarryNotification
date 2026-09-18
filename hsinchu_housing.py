@@ -12,7 +12,7 @@
   python hsinchu_housing.py 114S1 114S2   # 指定季別
 """
 import csv, io, os, re, sys, json, ssl, html, datetime, collections, statistics
-import urllib.request, urllib.parse
+import urllib.request, urllib.parse, zipfile
 
 
 
@@ -66,21 +66,36 @@ def house_age(built, deal):
     return round(((int(deal[:4]) - int(built[:4])) * 12 + int(deal[5:7]) - int(built[5:7])) / 12.0, 1)
 
 
+FETCH_LOG = []   # [(來源, 狀態, 位元組, 筆數)]，供 main() 收尾時檢視
+
+
+def parse_lvr_csv(data):
+    """吃原始 bytes，吐掉第二列英文欄名說明後的資料列。"""
+    rows = list(csv.DictReader(io.StringIO(data.decode("utf-8-sig", "replace"))))
+    return [r for r in rows if r.get("鄉鎮市區") and not r["鄉鎮市區"].startswith("The villages")]
+
+
 def fetch(code, season, kind):
+    """抓季別歷史檔。當季的季檔要整季結束才生成，季中抓到的是空檔（不是錯誤）。"""
     os.makedirs(CACHE, exist_ok=True)
+    tag = "%s/%s/%s" % (code, season, kind)
     path = os.path.join(CACHE, "%s_%s_%s.csv" % (code, season, kind))
     if not os.path.exists(path):
         try:
             with urllib.request.urlopen(BASE.format(season=season, code=code, kind=kind), timeout=60) as r:
                 data = r.read()
         except Exception as e:
-            print("  ! %s/%s/%s 下載失敗: %s" % (code, season, kind, e), file=sys.stderr)
+            print("  ! %s 季別檔下載失敗: %s" % (tag, e), file=sys.stderr)
+            FETCH_LOG.append((tag, "下載失敗: %s" % e, 0, 0))
             return []
         if len(data) < 300:
+            print("  · %s 季別檔尚未生成或為空（%d bytes）" % (tag, len(data)))
+            FETCH_LOG.append((tag, "空檔", len(data), 0))
             return []
         open(path, "wb").write(data)
-    rows = list(csv.DictReader(io.StringIO(open(path, "rb").read().decode("utf-8-sig", "replace"))))
-    return [r for r in rows if r.get("鄉鎮市區") and not r["鄉鎮市區"].startswith("The villages")]
+    rows = parse_lvr_csv(open(path, "rb").read())
+    FETCH_LOG.append((tag, "ok", os.path.getsize(path), len(rows)))
+    return rows
 
 
 ROAD_RE = re.compile(r"^(?:新竹[縣市])?(?:[^市鄉鎮區]{1,3}[市鄉鎮區])?(?:新竹市)?"
@@ -240,6 +255,8 @@ DATA_DIR = os.path.join(OUT_DIR, "data")
 STATE_PATH = os.path.join(DATA_DIR, "seen.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "history.json")
 HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "60"))
+# 實價登錄申報後約 30 天才揭露，最新成交日正常落後 10~40 天；超過這個天數視為來源停更
+STALE_DAYS = int(os.environ.get("STALE_DAYS", "45"))
 SITE_URL = os.environ.get("SITE_URL", "https://barryhuang.github.io/BarryNotification/")
 
 
@@ -254,6 +271,19 @@ def recent_seasons(n=NUM_SEASONS, today=None):
         if q == 0:
             q, y = 4, y - 1
     return list(reversed(out))
+
+
+def data_freshness(*groups):
+    """回傳 (最新成交日, 距今天數)。抓不到任何資料時回 (None, None)。
+
+    這是判斷「來源有沒有在更新」的唯一可靠訊號：季別歷史檔在季中不會長大，
+    最新成交日就會卡住不動，但下載一樣成功，從 log 看不出異狀。
+    """
+    days = [d["成交日"] for g in groups for d in g if d.get("成交日")]
+    if not days:
+        return None, None
+    latest = max(days)
+    return latest, (datetime.date.today() - datetime.date.fromisoformat(latest)).days
 
 
 def med(v): return round(statistics.median(v), 1)
@@ -554,10 +584,25 @@ def render(resale, presale, skipped, seasons, name_idx=None, history=None):
     nav = '<a href="#每日更新">每日更新</a>' + nav
     tmpl = open(os.path.join(HERE, "hsinchu_template.html"), encoding="utf-8").read()
     updated = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+
+    latest, lag = data_freshness(resale, presale)
+    stale = latest is None or lag > STALE_DAYS
+    fresh = '<li%s>資料涵蓋到 <b>%s</b>%s</li>' % (
+        ' class="stale"' if stale else "", esc(latest or "—"),
+        esc("（落後 %d 天）" % lag) if latest else "")
+    alert = ""
+    if latest is None:
+        alert = ('<p class="alert">這次一筆成交都沒抓到，以下數字沿用上一版報表，'
+                 '請檢查內政部開放資料的下載來源。</p>')
+    elif stale:
+        alert = ('<p class="alert">來源已 <b>%d</b> 天沒有新資料（最新成交日 %s）。'
+                 '每日更新紀錄裡的「無新增」期間，只代表來源沒長大，不代表市場沒有成交。</p>'
+                 % (lag, esc(latest)))
+
     values = dict(nav=nav, body="".join(parts), total=len(resale), skipped=skipped,
                   overview=build_overview(resale, seasons), daily=build_daily(history or []),
                   span="%s – %s" % (season_label(seasons[0]), season_label(seasons[-1])),
-                  lo=int(LO), hi=int(HI), updated=updated)
+                  lo=int(LO), hi=int(HI), updated=updated, fresh=fresh, alert=alert)
     for k, v in values.items():
         tmpl = tmpl.replace("{{%s}}" % k, str(v))
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -675,7 +720,7 @@ def region_summary(resale):
     return lines
 
 
-def build_message(new_resale, new_presale, resale, baseline=False):
+def build_message(new_resale, new_presale, resale, baseline=False, fresh=(None, None)):
     def group(rows, key):
         g = collections.defaultdict(list)
         for d in rows:
@@ -690,6 +735,15 @@ def build_message(new_resale, new_presale, resale, baseline=False):
         return ("%.1f萬/坪" % ups[0]) if ups else "—"
 
     lines = ["🏠 新竹房價報表 %s" % datetime.date.today().strftime("%m/%d"), ""]
+
+    latest, lag = fresh
+    if latest is None:
+        lines.append("⚠️ 這次一筆資料都沒抓到，報表數字沿用舊檔，請檢查下載來源。")
+        lines.append("")
+    elif lag is not None and lag > STALE_DAYS:
+        lines.append("⚠️ 來源已 %d 天沒有新資料（最新成交日 %s），"
+                     "「無新成交」不代表真的沒成交。" % (lag, latest))
+        lines.append("")
 
     if baseline:
         lines.append("（首次建立比對基準，未列新成交）")
@@ -727,12 +781,113 @@ def build_message(new_resale, new_presale, resale, baseline=False):
     lines.append("【各區中位單價】")
     lines += region_summary(resale)
     lines.append("")
+    if latest:
+        lines.append("資料涵蓋到 %s（落後 %d 天）" % (latest, lag))
     lines.append("完整報表 " + SITE_URL)
     return "\n".join(lines)
 
 
+# =====================================================================
+#  --probe：探測內政部開放資料的下載端點
+#
+#  季別歷史檔（DownloadSeason）在季中不會更新，每月 1/11/21 的新揭露是放在
+#  網站的「本期下載」。本期檔的網址官方沒有寫在文件裡，只能實地探測；而且
+#  多數沙箱／本機連不到 plvr，所以這個模式是設計成在 GitHub Actions 上跑
+#  （workflow_dispatch → mode=probe），從 log 讀結果。
+# =====================================================================
+
+OPENDATA_PAGE = "https://plvr.land.moi.gov.tw/DownloadOpenData"
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+
+def _get(url, timeout=60):
+    """回傳 (狀態碼, content-type, bytes)；連不到就回 (None, 錯誤訊息, b"")。"""
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=_ctx) as r:
+            return r.getcode(), r.headers.get("Content-Type", ""), r.read()
+    except Exception as e:
+        return None, str(e), b""
+
+
+def _describe(data):
+    """看一眼抓回來的是什麼：zip 就列成員，csv 就報欄數與最新交易年月日。"""
+    if data[:2] == b"PK":
+        try:
+            z = zipfile.ZipFile(io.BytesIO(data))
+        except Exception as e:
+            return "zip 但解不開: %s" % e
+        names = z.namelist()
+        out = ["zip，%d 個檔案" % len(names)]
+        for n in sorted(names)[:8]:
+            out.append("      %s (%d bytes)" % (n, z.getinfo(n).file_size))
+        if len(names) > 8:
+            out.append("      …另 %d 個" % (len(names) - 8))
+        for n in ("O_lvr_land_A.csv", "J_lvr_land_A.csv"):
+            if n in names:
+                rows = parse_lvr_csv(z.read(n))
+                ds = sorted(r.get("交易年月日", "") for r in rows if r.get("交易年月日"))
+                out.append("      %s：%d 筆，交易年月日 %s ~ %s"
+                           % (n, len(rows), ds[0] if ds else "—", ds[-1] if ds else "—"))
+        return "\n".join(out)
+    head = data[:120].decode("utf-8-sig", "replace").replace("\n", " ⏎ ")
+    if b"," in data[:200]:
+        rows = parse_lvr_csv(data)
+        ds = sorted(r.get("交易年月日", "") for r in rows if r.get("交易年月日"))
+        return "csv，%d 筆，交易年月日 %s ~ %s" % (len(rows), ds[0] if ds else "—", ds[-1] if ds else "—")
+    return "前 120 bytes: %s" % head
+
+
+def probe():
+    cur = recent_seasons(1)[0]
+    prev = recent_seasons(2)[0]
+    print("本季 %s，上一季 %s，今天 %s\n" % (cur, prev, TODAY))
+
+    print("=== 1. 下載頁本身有哪些連結 ===")
+    code, ctype, data = _get(OPENDATA_PAGE)
+    print("  %s → %s %s %d bytes" % (OPENDATA_PAGE, code, ctype, len(data)))
+    if data:
+        text = data.decode("utf-8", "replace")
+        hits = set(re.findall(r"[/\w]*Download[^\s\"'<>()]*", text))
+        hits |= set(re.findall(r"fileName=[^\s\"'<>&]*", text))
+        for h in sorted(hits)[:40]:
+            print("      %s" % h[:160])
+        if not hits:
+            print("      （頁面裡沒有直接的下載網址，可能是 JS 組出來的）")
+    print()
+
+    print("=== 2. 候選端點實測 ===")
+    cands = [
+        ("季別 csv（現在用的）", BASE.format(season=cur, code="O", kind="A")),
+        ("季別 csv 上一季", BASE.format(season=prev, code="O", kind="A")),
+        ("季別 zip 本季", "https://plvr.land.moi.gov.tw/DownloadSeason?season=%s&type=zip&fileName=lvr_landcsv.zip" % cur),
+        ("季別 zip 上一季", "https://plvr.land.moi.gov.tw/DownloadSeason?season=%s&type=zip&fileName=lvr_landcsv.zip" % prev),
+        ("本期 zip A", "https://plvr.land.moi.gov.tw/Download?fileName=lvr_landcsv.zip"),
+        ("本期 zip B", "https://plvr.land.moi.gov.tw/Download?type=zip&fileName=lvr_landcsv.zip"),
+        ("本期 csv C", "https://plvr.land.moi.gov.tw/Download?fileName=O_lvr_land_A.csv"),
+        ("本期 zip D", "https://plvr.land.moi.gov.tw/DownloadHistory?type=zip&fileName=lvr_landcsv.zip"),
+        ("本期 zip E", "https://plvr.land.moi.gov.tw/DownloadSeason?type=zip&fileName=lvr_landcsv.zip"),
+    ]
+    for label, url in cands:
+        code, ctype, data = _get(url)
+        print("  [%s] %s" % (label, url))
+        if code is None:
+            print("      連線失敗: %s" % ctype)
+            continue
+        print("      %s %s %d bytes" % (code, ctype, len(data)))
+        if len(data) >= 300:
+            print("      %s" % _describe(data))
+        elif data:
+            print("      太小，內容: %s" % data[:200].decode("utf-8", "replace").replace("\n", " ⏎ "))
+        print()
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if "--probe" in sys.argv:
+        probe()
+        return
     notify = "--no-notify" not in sys.argv
     first_run = "--seed" in sys.argv
     seasons = args or recent_seasons()
@@ -743,6 +898,19 @@ def main():
     # 預售登錄早於完工數年，取更長的期間才對得到建案名稱
     name_idx = build_name_index(collect_presale(recent_seasons(NAME_SEASONS)))
     print("成屋 %d 筆、預售 %d 筆（另 %d 筆缺完工年月）" % (len(resale), len(presale), skipped))
+
+    empty = sorted({t for t, st, _, _ in FETCH_LOG if st != "ok"})
+    if empty:
+        print("抓不到內容的季別檔 %d 個：%s%s"
+              % (len(empty), ", ".join(empty[:12]),
+                 " …另 %d 個" % (len(empty) - 12) if len(empty) > 12 else ""))
+    latest, lag = data_freshness(resale, presale)
+    if latest is None:
+        print("!! 一筆資料都沒抓到，來源可能整個掛了。", file=sys.stderr)
+    else:
+        print("最新成交日 %s（落後 %d 天）%s"
+              % (latest, lag, "  ← 超過 %d 天，來源疑似停更" % STALE_DAYS
+                 if lag > STALE_DAYS else ""))
 
     seen = load_seen()
     baseline = first_run or not seen
@@ -759,7 +927,7 @@ def main():
     write_csv(presale, "hsinchu_presale.csv")
 
     # 不論有沒有新成交都發通知
-    msg = build_message(new_resale, new_presale, resale, baseline)
+    msg = build_message(new_resale, new_presale, resale, baseline, (latest, lag))
     print(msg)
     if notify:
         token = get_line_token()

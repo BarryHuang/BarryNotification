@@ -40,6 +40,10 @@ h1{font-size:clamp(30px,5.4vw,46px); letter-spacing:-.01em}
 .lede{margin:0; max-width:62ch; color:var(--ink-2); font-size:16px}
 .meta{display:flex; flex-wrap:wrap; gap:8px 26px; margin:0; padding:0; list-style:none; font-size:13px; color:var(--muted)}
 .meta b{color:var(--ink); font-weight:600}
+.meta li.stale, .meta li.stale b{color:var(--warm)}
+.alert{margin:0; padding:10px 14px; border-radius:8px; font-size:13.5px; line-height:1.6;
+  color:var(--warm); background:var(--surface); border:1px solid var(--warm)}
+.alert b{color:var(--warm)}
 nav.jump{display:flex; flex-wrap:wrap; gap:8px}
 nav.jump a{
   font-size:13px; text-decoration:none; color:var(--ink-2); background:var(--surface);
@@ -230,6 +234,7 @@ code{font-family:"IBM Plex Mono",monospace; font-size:.92em; background:var(--su
     <li>單位 <b>萬元/坪</b></li>
     <li>來源 <b>內政部不動產成交案件實際資訊資料供應系統</b></li>
     <li>更新 <b>{{updated}}</b></li>
+    {{fresh}}
   </ul>
   <div class="axis">
     <span>價格軸</span>
@@ -241,6 +246,7 @@ code{font-family:"IBM Plex Mono",monospace; font-size:.92em; background:var(--su
     <span>建案＝同路段＋同建築完工年月的門牌群</span>
   </div>
   <nav class="jump">{{nav}}</nav>
+  {{alert}}
 </header>
 
 {{overview}}

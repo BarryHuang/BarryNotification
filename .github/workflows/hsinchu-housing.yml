@@ -6,6 +6,13 @@ on:
     - cron: '0 23 * * *'
   workflow_dispatch:
     inputs:
+      mode:
+        description: '執行模式（probe＝只探測官網下載端點，不產表、不發 LINE）'
+        type: choice
+        options:
+          - report
+          - probe
+        default: report
       seed:
         description: '重建比對基準（不發 LINE 通知）'
         type: boolean
@@ -30,7 +37,15 @@ jobs:
         with:
           python-version: '3.11'
 
+      # 季別檔在季中不會更新，本期檔的網址官方沒有文件。這一步實地探測，
+      # 從 log 讀出哪個端點拿得到最新一期的資料。
+      - name: Probe open-data endpoints
+        if: ${{ inputs.mode == 'probe' }}
+        run: |
+          python hsinchu_housing.py --probe
+
       - name: Build report and notify
+        if: ${{ inputs.mode != 'probe' }}
         env:
           LINE_CLIENT_ID: ${{ secrets.LINE_CLIENT_ID }}
           LINE_CLIENT_SECRET: ${{ secrets.LINE_CLIENT_SECRET }}
@@ -39,6 +54,7 @@ jobs:
           python hsinchu_housing.py ${{ inputs.seed && '--seed' || '' }}
 
       - name: Commit updated report
+        if: ${{ inputs.mode != 'probe' }}
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
