@@ -77,11 +77,12 @@ jobs:
         run: |
           python innoknight_parking.py --probe-browser
 
+      # monitor 模式也會留下現場，判讀出問題時可以直接下載 HTML 與截圖
       - name: Upload probe output
-        if: ${{ always() && github.event_name == 'workflow_dispatch' && (inputs.mode == 'probe-browser' || inputs.mode == '') }}
+        if: ${{ always() && inputs.mode != 'probe' }}
         uses: actions/upload-artifact@v4
         with:
-          name: innoknight-probe
+          name: innoknight-probe-${{ github.run_number }}
           path: probe_out/
           if-no-files-found: warn
 
