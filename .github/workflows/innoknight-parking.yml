@@ -1,0 +1,116 @@
+name: InnoKnight 車位監控
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '執行模式'
+        type: choice
+        options:
+          - probe-browser
+          - probe
+          - monitor
+        default: probe-browser
+      keyword:
+        description: '車位查詢 keyword（留空=用預設）'
+        type: string
+        default: ''
+      force_notify:
+        description: 'monitor 模式：就算沒有新空位也強制發一則 LINE（測試用）'
+        type: boolean
+        default: false
+  schedule:
+    # 每 15 分鐘查一次。GitHub 的排程常有數分鐘延遲，實際間隔會比 15 分略長。
+    # 排程只會在預設分支（main）上跑。
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: innoknight-parking
+  # 15 分鐘一輪，萬一有一輪卡住就讓新的接手，不要愈積愈多
+  cancel-in-progress: true
+
+jobs:
+  check-parking:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 先確認 runner 連不連得到目標站，跟一般網站做對照
+      - name: Connectivity check
+        continue-on-error: true
+        run: |
+          echo "--- 對照組 ---"
+          curl -sS -o /dev/null --max-time 20 \
+            -w 'example.com  http=%{http_code} connect=%{time_connect}s total=%{time_total}s\n' \
+            https://example.com || echo "example.com 失敗 (exit $?)"
+          echo "--- 目標站 ---"
+          curl -sS -o /dev/null --max-time 30 \
+            -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' \
+            -w 'iot.innoknight.com  http=%{http_code} ip=%{remote_ip} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s size=%{size_download}\n' \
+            https://iot.innoknight.com/ || echo "目標站失敗 (exit $?)"
+
+      - name: Install Playwright
+        if: ${{ inputs.mode != 'probe' }}
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      # 用真實瀏覽器開頁面，把 SPA 自己打的 API 全部側錄下來
+      - name: Probe with browser
+        if: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'probe-browser' || inputs.mode == '') }}
+        env:
+          INNOKNIGHT_KEYWORD: ${{ inputs.keyword }}
+        run: |
+          python innoknight_parking.py --probe-browser
+
+      - name: Upload probe output
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && (inputs.mode == 'probe-browser' || inputs.mode == '') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: innoknight-probe
+          path: probe_out/
+          if-no-files-found: warn
+
+      # 不裝瀏覽器的輕量版：掃 js bundle、試打常見端點
+      - name: Probe over plain HTTP
+        if: ${{ inputs.mode == 'probe' }}
+        env:
+          INNOKNIGHT_KEYWORD: ${{ inputs.keyword }}
+        run: |
+          python innoknight_parking.py --probe
+
+      - name: Run monitor
+        if: ${{ github.event_name == 'schedule' || inputs.mode == 'monitor' }}
+        env:
+          INNOKNIGHT_KEYWORD: ${{ inputs.keyword }}
+          LINE_CLIENT_ID: ${{ secrets.LINE_CLIENT_ID }}
+          LINE_CLIENT_SECRET: ${{ secrets.LINE_CLIENT_SECRET }}
+        run: |
+          python innoknight_parking.py \
+            ${{ inputs.force_notify && '--force-notify' || '' }}
+
+      # 記住上一輪的空位，同一個空位就不會每 15 分鐘重複通知。
+      # 狀態沒變就不寫檔，也就不會有多餘的 commit。
+      - name: Persist monitor state
+        if: ${{ github.event_name == 'schedule' || inputs.mode == 'monitor' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/data/parking_seen.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "狀態無變動，不需 commit。"
+          else
+            git commit -m "更新車位監控狀態 $(date -u +'%Y-%m-%dT%H:%MZ')"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
