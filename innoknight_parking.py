@@ -217,19 +217,26 @@ def probe():
 def render_page(out_dir=None, settle_ms=6000):
     """開一顆 Chromium 把 SPA 載完。
 
-    回傳 (calls, text, html)：
-      calls — 所有 XHR/fetch 的網址、payload、回應原文
+    回傳 (calls, text, html, diag)：
+      calls — 側錄到的網路請求（網址、payload、回應原文）
       text  — 渲染完成後畫面上的文字（DOM 備援解析用）
       html  — 渲染完成後的 HTML
+      diag  — 最終網址、標題、console 訊息等診斷資訊
 
-    SPA 的資料一定是前端自己去要的，與其猜端點，不如把瀏覽器實際發出的請求
-    原封不動收下來。就算 API 欄位看不懂，畫面文字也還能當第二條解析路徑。
+    導覽分兩段做。直接 goto 帶 hash 的深層網址時，實測最後會停在
+    `#/`：瀏覽器不會把 fragment 送給伺服器，SPA 的 router 在 app 還沒
+    開機完成前就把路由收掉了。所以先載首頁等 app 起來，再用 client-side
+    routing 切到查詢路由，讓 router 自己去打 API。
     """
     from playwright.sync_api import sync_playwright
 
     calls = []
     text = ""
     html = ""
+    diag = {"console": [], "errors": [], "nav": []}
+
+    # 圖片字體之類的靜態資源不用收，其餘一律收——資料不一定走 xhr/fetch
+    SKIP_TYPES = ("image", "font", "stylesheet", "media")
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(args=["--disable-gpu", "--no-sandbox"])
@@ -241,7 +248,7 @@ def render_page(out_dir=None, settle_ms=6000):
 
         def on_response(resp):
             req = resp.request
-            if req.resource_type not in ("xhr", "fetch"):
+            if req.resource_type in SKIP_TYPES:
                 return
             try:
                 body = resp.text()
@@ -251,6 +258,7 @@ def render_page(out_dir=None, settle_ms=6000):
                 "method": req.method,
                 "url": req.url,
                 "status": resp.status,
+                "resource_type": req.resource_type,
                 "post_data": req.post_data,
                 "req_headers": {
                     k: v for k, v in req.headers.items()
@@ -262,18 +270,49 @@ def render_page(out_dir=None, settle_ms=6000):
             })
 
         page.on("response", on_response)
+        page.on("console", lambda m: diag["console"].append(f"[{m.type}] {m.text}"[:500]))
+        page.on("pageerror", lambda e: diag["errors"].append(str(e)[:500]))
 
+        def settle(label, ms):
+            try:
+                page.wait_for_load_state("networkidle", timeout=30000)
+            except Exception as e:
+                print(f"  {label}: networkidle 未達成（{type(e).__name__}），繼續")
+            page.wait_for_timeout(ms)
+            diag["nav"].append(f"{label} -> {page.url}")
+            print(f"  {label} 後網址：{page.url}")
+
+        # 第一段：載首頁，讓 SPA 開機
         try:
-            page.goto(PAGE_URL, wait_until="networkidle", timeout=60000)
+            page.goto(SITE + "/", wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
-            print(f"  goto 逾時或失敗：{type(e).__name__}: {e}（仍繼續看已載到的東西）")
-        page.wait_for_timeout(settle_ms)
+            print(f"  首頁 goto 失敗：{type(e).__name__}: {e}")
+        settle("載入首頁", 3000)
+
+        # 第二段：用 client-side routing 切到查詢路由
+        route = f"/search/devices?keyword={urllib.parse.quote(KEYWORD, safe='')}"
+        try:
+            page.evaluate("h => { window.location.hash = h; }", route)
+        except Exception as e:
+            print(f"  設定 hash 失敗：{type(e).__name__}: {e}")
+        settle("切換路由", settle_ms)
+
+        # router 若把我們踢回首頁，退一步再試整個深層網址（有些 app 只吃硬導覽）
+        if "search" not in page.url:
+            print("  路由被收掉了，改用完整深層網址硬導覽一次")
+            try:
+                page.goto(PAGE_URL, wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                print(f"  深層 goto 失敗：{type(e).__name__}: {e}")
+            settle("硬導覽", settle_ms)
 
         final_url = page.url
         try:
             title = page.title()
         except Exception:
             title = ""
+        diag["final_url"] = final_url
+        diag["title"] = title
         try:
             text = page.inner_text("body")
         except Exception as e:
@@ -291,6 +330,8 @@ def render_page(out_dir=None, settle_ms=6000):
                 f.write(text)
             with open(os.path.join(out_dir, "page.html"), "w", encoding="utf-8") as f:
                 f.write(html)
+            with open(os.path.join(out_dir, "diag.json"), "w", encoding="utf-8") as f:
+                json.dump(diag, f, ensure_ascii=False, indent=2)
             try:
                 page.screenshot(path=os.path.join(out_dir, "page.png"), full_page=True)
             except Exception as e:
@@ -298,10 +339,9 @@ def render_page(out_dir=None, settle_ms=6000):
 
         browser.close()
 
-    print(f"  最終網址：{final_url}")
     if title:
         print(f"  標題：{title}")
-    return calls, text, html
+    return calls, text, html, diag
 
 
 def probe_browser(out_dir="probe_out"):
@@ -309,12 +349,17 @@ def probe_browser(out_dir="probe_out"):
     print(f"用瀏覽器開：{PAGE_URL}")
     print("=" * 70)
 
-    calls, text, _ = render_page(out_dir=out_dir)
+    calls, text, _, diag = render_page(out_dir=out_dir)
 
-    print(f"\n### 側錄到 {len(calls)} 支 XHR/fetch")
+    print(f"\n### 導覽過程")
+    for n in diag.get("nav", []):
+        print(f"  {n}")
+
+    print(f"\n### 側錄到 {len(calls)} 個請求（已排除圖片字體等靜態資源）")
     for i, c in enumerate(calls, 1):
         print(f"\n  --- [{i}] {c['method']} {c['url']}")
-        print(f"      status={c['status']}  content-type={c['resp_content_type']}")
+        print(f"      status={c['status']}  type={c.get('resource_type')}  "
+              f"content-type={c['resp_content_type']}")
         if c["req_headers"]:
             print(f"      req headers: {json.dumps(c['req_headers'], ensure_ascii=False)}")
         if c["post_data"]:
@@ -325,6 +370,15 @@ def probe_browser(out_dir="probe_out"):
 
     print(f"\n### 渲染後的畫面文字（{len(text)} 字）")
     print("  " + text[:4000].replace("\n", "\n  "))
+
+    if diag.get("console"):
+        print(f"\n### 瀏覽器 console（{len(diag['console'])} 則）")
+        for m in diag["console"][:40]:
+            print(f"  {m}")
+    if diag.get("errors"):
+        print(f"\n### 頁面 JS 錯誤（{len(diag['errors'])} 則）")
+        for m in diag["errors"][:20]:
+            print(f"  {m}")
 
     print("\n### 自動判讀結果（正式監控會用這套邏輯）")
     devices = extract_devices(calls, text)
@@ -496,17 +550,26 @@ def run_monitor(force_notify=False):
     stamp = taipei.strftime("%Y-%m-%d %H:%M")
 
     print(f"檢查時間：{stamp} (台灣時間)")
-    calls, text, _ = render_page()
-    print(f"  側錄到 {len(calls)} 支 XHR/fetch，畫面文字 {len(text)} 字")
+    # 也把現場存成檔案上傳成 artifact，判讀出問題時才有 HTML 與截圖可看
+    calls, text, _, diag = render_page(out_dir="probe_out")
+    print(f"  側錄到 {len(calls)} 個請求，畫面文字 {len(text)} 字")
 
     devices = extract_devices(calls, text)
     report_devices(devices)
 
     if not devices:
         print("判讀不到車位，這一輪不通知也不更新狀態，避免用壞掉的資料蓋掉紀錄。")
+        # 判讀失敗時把現場資訊全印出來，下一輪才有東西可以調整
+        for n in diag.get("nav", []):
+            print(f"  [nav] {n}")
         for c in calls:
-            print(f"  [debug] {c['method']} {c['url']} -> {c['status']} "
-                  f"{(c.get('body') or '')[:200]}")
+            print(f"  [req] {c['method']} {c['url']} -> {c['status']} "
+                  f"({c.get('resource_type')}) {(c.get('body') or '')[:300]}")
+        print(f"  [page text] {text[:1500]!r}")
+        for m in diag.get("console", [])[:20]:
+            print(f"  [console] {m}")
+        for m in diag.get("errors", [])[:10]:
+            print(f"  [jserror] {m}")
         if force_notify:
             token = get_line_token()
             if token:
