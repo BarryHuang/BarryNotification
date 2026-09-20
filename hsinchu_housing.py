@@ -816,107 +816,119 @@ def build_message(new_resale, new_presale, resale, baseline=False, fresh=(None, 
 #  本期下載：每月 1、11、21 日更新的最近一期
 #
 #  季別歷史檔（DownloadSeason）要整季結束才生成，季中只靠季檔會完全抓不到
-#  新揭露——這正是報表從 8/29 起天天「無新成交」的原因。本期檔的網址官方
-#  沒有文件，所以這裡不寫死：先用上次成功的網址，失敗才掃候選清單、再不行
-#  就去下載頁把連結挖出來；每個候選都要通過驗證（解得開、含我們要的縣市檔、
-#  有交易年月日）才算數，成功後把網址記進 docs/data/source.json。
+#  新揭露——這正是報表從 8/29 起天天「無新成交」的原因。
+#
+#  端點是 --probe 在 GitHub Actions 上實測出來的（2026-09-19）：
+#    Download?fileName=O_lvr_land_A.csv        → 200, 51KB, 143 筆, 最新 1150815
+#    Download?type=zip&fileName=lvr_landcsv.zip → 200, 1.9MB, 225 個檔
+#    DownloadSeason?season=115S3&…（本季季檔）  → 200 但只有 441 bytes 的 HTML 錯誤頁
+#  預設走單縣市 csv：只要 4 個請求、約 200KB，比 1.9MB 的全國 zip 省得多。
+#
+#  注意官網查無檔案時回的是 200 + text/html，不是 404，所以驗證看的是
+#  content-type 與長度，不能只看狀態碼。
 # =====================================================================
 
-CURRENT_CANDIDATES = [
-    "https://plvr.land.moi.gov.tw/Download?type=zip&fileName=lvr_landcsv.zip",
-    "https://plvr.land.moi.gov.tw/Download?fileName=lvr_landcsv.zip",
-    "https://plvr.land.moi.gov.tw/DownloadSeason?type=zip&fileName=lvr_landcsv.zip",
-    "https://plvr.land.moi.gov.tw/DownloadHistory?type=zip&fileName=lvr_landcsv.zip",
-]
+CURRENT_CSV = "https://plvr.land.moi.gov.tw/Download?fileName={code}_lvr_land_{kind}.csv"
+CURRENT_ZIP = "https://plvr.land.moi.gov.tw/Download?type=zip&fileName=lvr_landcsv.zip"
 
 
-def _unpack_current(data):
-    """驗證並解開本期 zip，回傳 {(縣市代號, 檔別): 原始列}；不合格回 {}。"""
-    if data[:2] != b"PK":
+def _codes():
+    return sorted({cfg["code"] for cfg in REGIONS.values()})
+
+
+def _looks_like_data(ctype, data):
+    """查無檔案時官網回 200 + 441 bytes 的 HTML，所以狀態碼不能當判斷依據。"""
+    return len(data) >= 300 and "html" not in (ctype or "").lower()
+
+
+def _current_via_csv():
+    """逐縣市抓本期 csv，只拿我們要的 4 個檔。"""
+    out = {}
+    for code in _codes():
+        for kind in ("A", "B"):
+            url = CURRENT_CSV.format(code=code, kind=kind)
+            st, ctype, data = _get(url)
+            if st is None:
+                print("  · 本期 %s_%s 連不上: %s" % (code, kind, ctype))
+                continue
+            if not _looks_like_data(ctype, data):
+                print("  · 本期 %s_%s 回 %s %s %d bytes，不是資料檔"
+                      % (code, kind, st, ctype, len(data)))
+                continue
+            rows = parse_lvr_csv(data)
+            if rows and any(r.get("交易年月日") for r in rows):
+                out[(code, kind)] = rows
+    return out
+
+
+def _current_via_zip():
+    """備援：本期全國 zip。壓縮檔裡的檔名是小寫（o_lvr_land_a.csv）。"""
+    st, ctype, data = _get(CURRENT_ZIP)
+    if st is None:
+        print("  · 本期 zip 連不上: %s" % ctype)
+        return {}
+    if not _looks_like_data(ctype, data) or data[:2] != b"PK":
+        print("  · 本期 zip 回 %s %s %d bytes，不是 zip" % (st, ctype, len(data)))
         return {}
     try:
         z = zipfile.ZipFile(io.BytesIO(data))
-    except Exception:
+    except Exception as e:
+        print("  · 本期 zip 解不開: %s" % e)
         return {}
-    names = set(z.namelist())
+    by_lower = {n.lower(): n for n in z.namelist()}
     out = {}
-    for code in sorted({cfg["code"] for cfg in REGIONS.values()}):
+    for code in _codes():
         for kind in ("A", "B"):
-            n = "%s_lvr_land_%s.csv" % (code, kind)
-            if n not in names:
+            n = by_lower.get("%s_lvr_land_%s.csv" % (code.lower(), kind.lower()))
+            if not n:
                 continue
             try:
                 rows = parse_lvr_csv(z.read(n))
             except Exception as e:
-                print("  · 本期檔裡的 %s 解析失敗: %s" % (n, e))
+                print("  · 本期 zip 裡的 %s 解析失敗: %s" % (n, e))
                 continue
             if rows and any(r.get("交易年月日") for r in rows):
                 out[(code, kind)] = rows
     return out
 
 
-def _page_candidates():
-    """官方沒有文件，從下載頁把 lvr_landcsv.zip 的連結挖出來當候選。"""
-    _, _, data = _get(OPENDATA_PAGE, timeout=30)
-    if not data:
-        return []
-    text = data.decode("utf-8", "replace")
-    hits = re.findall(r"""['"]([^'"\s]*[Dd]ownload[^'"\s]*lvr_landcsv\.zip[^'"\s]*)['"]""", text)
-    return list(dict.fromkeys(urllib.parse.urljoin(OPENDATA_PAGE, h) for h in hits))
+CURRENT_MODES = [("csv", _current_via_csv), ("zip", _current_via_zip)]
 
 
 def load_source():
     try:
         with open(SOURCE_PATH, encoding="utf-8") as f:
-            return json.load(f).get("url") or None
+            return json.load(f).get("mode") or None
     except Exception:
         return None
 
 
-def save_source(url):
+def save_source(mode):
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(SOURCE_PATH, "w", encoding="utf-8") as f:
-        json.dump({"url": url, "updated": datetime.date.today().isoformat()},
+        json.dump({"mode": mode, "updated": datetime.date.today().isoformat()},
                   f, ensure_ascii=False, indent=1)
 
 
 def fetch_current():
-    """回傳本期資料 {(縣市代號, 檔別): 原始列}；全部端點都不行時回 {}。"""
+    """回傳本期資料 {(縣市代號, 檔別): 原始列}；兩種取法都失敗時回 {}。"""
     remembered = load_source()
-
-    def attempts():
-        if remembered:
-            yield remembered
-        for u in CURRENT_CANDIDATES:
-            yield u
-        for u in _page_candidates():   # 前面都不行才會走到這裡，平常不會多打一次
-            yield u
-
-    tried = set()
-    for url in attempts():
-        if url in tried:
-            continue
-        tried.add(url)
-        code, ctype, data = _get(url)
-        if code is None:
-            print("  · 本期檔 %s 連不上: %s" % (url, ctype))
-            continue
-        got = _unpack_current(data)
+    modes = sorted(CURRENT_MODES, key=lambda m: m[0] != remembered)
+    for name, fn in modes:
+        got = fn()
         if not got:
-            print("  · 本期檔 %s 回 %s %s %d bytes，不是預期的資料"
-                  % (url, code, ctype, len(data)))
             continue
         n = sum(len(v) for v in got.values())
         ds = sorted(r.get("交易年月日", "") for v in got.values()
                     for r in v if r.get("交易年月日"))
-        print("  ✓ 本期檔 %s：%s 共 %d 筆，交易年月日 %s ~ %s"
-              % (url, "／".join("%s_%s" % k for k in sorted(got)), n, ds[0], ds[-1]))
-        FETCH_LOG.append(("本期", "ok", len(data), n))
-        if url != remembered:
-            save_source(url)
+        print("  ✓ 本期檔（%s）：%s 共 %d 筆，交易年月日 %s ~ %s"
+              % (name, "／".join("%s_%s" % k for k in sorted(got)), n, ds[0], ds[-1]))
+        FETCH_LOG.append(("本期(%s)" % name, "ok", 0, n))
+        if name != remembered:
+            save_source(name)
         return got
 
-    print("  ! 本期檔所有端點都失敗，只剩季別歷史檔（季中不會更新）。", file=sys.stderr)
+    print("  ! 本期檔抓不到，只剩季別歷史檔（季中不會更新）。", file=sys.stderr)
     FETCH_LOG.append(("本期", "全部失敗", 0, 0))
     return {}
 
@@ -993,15 +1005,10 @@ def probe():
 
     print("=== 2. 候選端點實測 ===")
     cands = [
-        ("季別 csv（現在用的）", BASE.format(season=cur, code="O", kind="A")),
+        ("季別 csv 本季（季中不存在）", BASE.format(season=cur, code="O", kind="A")),
         ("季別 csv 上一季", BASE.format(season=prev, code="O", kind="A")),
-        ("季別 zip 本季", "https://plvr.land.moi.gov.tw/DownloadSeason?season=%s&type=zip&fileName=lvr_landcsv.zip" % cur),
-        ("季別 zip 上一季", "https://plvr.land.moi.gov.tw/DownloadSeason?season=%s&type=zip&fileName=lvr_landcsv.zip" % prev),
-        ("本期 zip A", "https://plvr.land.moi.gov.tw/Download?fileName=lvr_landcsv.zip"),
-        ("本期 zip B", "https://plvr.land.moi.gov.tw/Download?type=zip&fileName=lvr_landcsv.zip"),
-        ("本期 csv C", "https://plvr.land.moi.gov.tw/Download?fileName=O_lvr_land_A.csv"),
-        ("本期 zip D", "https://plvr.land.moi.gov.tw/DownloadHistory?type=zip&fileName=lvr_landcsv.zip"),
-        ("本期 zip E", "https://plvr.land.moi.gov.tw/DownloadSeason?type=zip&fileName=lvr_landcsv.zip"),
+        ("本期 csv（現在用的）", CURRENT_CSV.format(code="O", kind="A")),
+        ("本期 zip（備援）", CURRENT_ZIP),
     ]
     for label, url in cands:
         code, ctype, data = _get(url)
@@ -1014,6 +1021,24 @@ def probe():
             print("      %s" % _describe(data))
         elif data:
             print("      太小，內容: %s" % data[:200].decode("utf-8", "replace").replace("\n", " ⏎ "))
+        print()
+
+    # 本期檔只有最近一期，本季稍早的幾期既不在季檔也不在本期檔。下載頁上
+    # 這幾個 ajax 端點看起來就是在列可下載的期別，探探看能不能補上缺口。
+    print("=== 3. 有沒有辦法列出／下載本季稍早的各期 ===")
+    for label, url in [
+        ("Download_ajax_list", "https://plvr.land.moi.gov.tw/Download_ajax_list"),
+        ("Download_ajax_active", "https://plvr.land.moi.gov.tw/Download_ajax_active"),
+        ("DownloadHistory_ajax_list", "https://plvr.land.moi.gov.tw/DownloadHistory_ajax_list"),
+    ]:
+        code, ctype, data = _get(url, timeout=30)
+        print("  [%s] %s" % (label, url))
+        if code is None:
+            print("      連線失敗: %s" % ctype)
+            continue
+        text = data.decode("utf-8", "replace")
+        print("      %s %s %d bytes" % (code, ctype, len(data)))
+        print("      %s" % text[:600].replace("\n", " ⏎ "))
         print()
 
 
