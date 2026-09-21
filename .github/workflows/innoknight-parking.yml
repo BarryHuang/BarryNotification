@@ -1,5 +1,17 @@
 name: InnoKnight 車位監控
 
+# 車位頁要登入才看得到。未登入時 app 讀不到 token，router 會把
+# #/search/devices 收掉丟回登入頁，一個資料請求都不會發。
+#
+# 需要一個 repo secret：INNOKNIGHT_SESSION
+#   在自己瀏覽器登入 iot.innoknight.com 之後，開開發者工具 console 執行
+#   copy(JSON.stringify(localStorage))，把結果整包貼進 secret。
+#   （若還是被擋，改用 copy(JSON.stringify({localStorage: {...localStorage},
+#     cookies: document.cookie})) 把 cookie 一起帶上。）
+#
+# token 會過期。過期時監控不會亂通知，只會發一則「要重新登入」的 LINE，
+# 並暫停到 secret 更新為止。
+
 on:
   workflow_dispatch:
     inputs:
@@ -74,6 +86,7 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'probe-browser' || inputs.mode == '') }}
         env:
           INNOKNIGHT_KEYWORD: ${{ inputs.keyword }}
+          INNOKNIGHT_SESSION: ${{ secrets.INNOKNIGHT_SESSION }}
         run: |
           python innoknight_parking.py --probe-browser
 
@@ -98,6 +111,7 @@ jobs:
         if: ${{ github.event_name == 'schedule' || inputs.mode == 'monitor' }}
         env:
           INNOKNIGHT_KEYWORD: ${{ inputs.keyword }}
+          INNOKNIGHT_SESSION: ${{ secrets.INNOKNIGHT_SESSION }}
           LINE_CLIENT_ID: ${{ secrets.LINE_CLIENT_ID }}
           LINE_CLIENT_SECRET: ${{ secrets.LINE_CLIENT_SECRET }}
         run: |
