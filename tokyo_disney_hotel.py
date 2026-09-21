@@ -51,8 +51,17 @@ DIGEST_HOUR_JST = 8
 DIGEST_DETAIL_LIMIT = 8
 
 ROOMS_NUM = 1
-ADULT_NUM = 2
-CHILD_NUM = 0
+ADULT_NUM = 2       # 官網定義「大人」為 18 歲以上
+CHILD_NUM = 1       # 女兒 7 歲，官網算「子ども」
+
+# 官網搜尋表單在有小孩時會帶上年齡與床位需求，編碼在這個參數裡。
+# 公開資料查不到格式，官網也連不上無法實測，所以先留空。
+# 若搜尋結果與官網手動查詢不一致，就到官網做一次「2 大 1 小」搜尋，
+# 把結果頁網址裡 childAgeBedInform 的值複製過來。
+CHILD_AGE_BED_INFORM = ""
+
+# 小孩年齡，只用於顯示，讓通知裡看得出查的是什麼條件
+CHILD_AGES = [7]
 
 # searchHotelCD 對照（迪士尼直營飯店）
 HOTELS = [
@@ -236,6 +245,16 @@ def humanize_delta(delta):
 
 # === 空房查詢 ===
 
+def occupancy_text():
+    """人數條件的文字描述，放進通知讓人一眼看出查的是什麼條件。"""
+    parts = [f"{ADULT_NUM} 大人"]
+    if CHILD_NUM:
+        ages = "、".join(f"{a} 歲" for a in CHILD_AGES[:CHILD_NUM])
+        parts.append(f"{CHILD_NUM} 小孩（{ages}）" if ages else f"{CHILD_NUM} 小孩")
+    parts.append(f"{ROOMS_NUM} 房")
+    return " / ".join(parts)
+
+
 def build_search_url(hotel_cd, use_date, staying_days):
     params = [
         ("showWay", ""),
@@ -245,7 +264,7 @@ def build_search_url(hotel_cd, use_date, staying_days):
         ("stayingDays", str(staying_days)),
         ("useDate", use_date.strftime("%Y%m%d")),
         ("cpListStr", ""),
-        ("childAgeBedInform", ""),
+        ("childAgeBedInform", CHILD_AGE_BED_INFORM),
         ("searchHotelCD", hotel_cd),
         ("searchHotelDiv", ""),
         ("hotelName", ""),
@@ -663,7 +682,7 @@ def render_scan_report(rows, start_date, days, staying_days):
 
     lines = []
     lines.append(f"掃描區間：{start_date} 起 {days} 天，每次 {staying_days} 晚，"
-                 f"{ADULT_NUM} 大人 / {ROOMS_NUM} 房")
+                 f"{occupancy_text()}")
     lines.append("")
     header = f"{'日期':<14}"
     for cd in hotel_codes:
@@ -1010,7 +1029,7 @@ def main():
     parts.append(f"🏰 東京迪士尼飯店空房監控")
     parts.append(f"📅 報告時間：{now_text}")
     parts.append(f"🛏 監控區間：{TARGET_START:%Y/%m/%d} ~ {TARGET_END:%m/%d}"
-                 f"（每日單晚，{ADULT_NUM} 大人 / {ROOMS_NUM} 房）")
+                 f"（每日單晚，{occupancy_text()}）")
     parts.append("━━━━━━━━━━━━━━━━━━")
 
     if not dates:
@@ -1091,7 +1110,7 @@ def run_urls(argv):
     hotel_names = dict(HOTELS)
     print(f"共 {len(dates) * len(codes)} 個網址"
           f"（{len(dates)} 個日期 x {len(codes)} 間飯店，每次 {nights} 晚，"
-          f"{ADULT_NUM} 大人 / {ROOMS_NUM} 房）\n")
+          f"{occupancy_text()}）\n")
     for d in dates:
         open_at = reservation_open_at(d)
         state = "可查" if now >= open_at else f"未開賣（{open_at:%m/%d %H:%M} JST 開）"

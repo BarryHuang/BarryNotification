@@ -45,13 +45,28 @@
   a.btn{flex:1 1 140px;text-align:center;text-decoration:none;padding:11px 8px;
         border-radius:9px;background:var(--accent);color:#fff;font-size:14px;font-weight:600}
   .row.locked a.btn{background:var(--lock);pointer-events:none}
+  .occrow{display:flex;gap:10px;flex-wrap:wrap}
+  .occrow label{flex:1 1 90px;font-size:13px;color:var(--muted)}
+  .occrow input{width:100%;margin-top:4px;padding:8px;border-radius:8px;
+                border:1px solid var(--line);background:var(--bg);color:var(--ink);
+                font-size:15px}
+  .hint{color:var(--muted);font-size:12px;margin-top:8px}
   .note{color:var(--muted);font-size:12.5px;margin-top:14px}
   .note code{background:var(--lockbg);padding:1px 5px;border-radius:4px}
 </style>
 </head>
 <body>
 <h1>🏰 迪士尼空房快查</h1>
-<div class="sub">2 大人 / 1 房 / 1 晚 · 點按鈕直接開官網搜尋結果</div>
+<div class="sub" id="occ">2 大人 / 1 小孩(7歲) / 1 房 / 1 晚 · 點按鈕直接開官網搜尋結果</div>
+<div class="panel">
+  <h2>人數條件</h2>
+  <div class="occrow">
+    <label>大人 <input id="ad" type="number" min="1" max="6" value="2"></label>
+    <label>小孩 <input id="ch" type="number" min="0" max="6" value="1"></label>
+    <label>房數 <input id="rm" type="number" min="1" max="3" value="1"></label>
+  </div>
+  <div class="hint">改了會立刻套用到下面所有按鈕。小孩年齡官網會在搜尋後另外問。</div>
+</div>
 
 <div class="panel">
   <h2>目標日期開賣倒數</h2>
@@ -83,9 +98,19 @@ function openAt(y,m,d){            // m: 1-12
   return new Date(Date.UTC(ny,nm-1,1,2,0));
 }
 
+function occ(){
+  const v = (id,dflt)=>{
+    const n = parseInt(document.getElementById(id).value,10);
+    return Number.isFinite(n) && n>=0 ? n : dflt;
+  };
+  return {ad:v("ad",2), ch:v("ch",1), rm:v("rm",1)};
+}
+
 function url(code,y,m,d){
+  const o = occ();
   const p = new URLSearchParams({
-    showWay:"", roomsNum:"1", adultNum:"2", childNum:"0", stayingDays:"1",
+    showWay:"", roomsNum:String(o.rm), adultNum:String(o.ad),
+    childNum:String(o.ch), stayingDays:"1",
     useDate:`${y}${pad(m)}${pad(d)}`, cpListStr:"", childAgeBedInform:"",
     searchHotelCD:code, searchHotelDiv:"", hotelName:"", searchHotelName:"",
     searchLayer:"", searchRoomName:"", hotelSearchDetail:"true", detailOpenFlg:"0",
@@ -111,6 +136,9 @@ function jstLabel(dt){
 
 function render(){
   const now = new Date();
+  const o = occ();
+  document.getElementById("occ").textContent =
+    `${o.ad} 大人${o.ch ? " / " + o.ch + " 小孩" : ""} / ${o.rm} 房 / 1 晚 · 點按鈕直接開官網搜尋結果`;
 
   document.getElementById("countdown").innerHTML = TARGETS.map(s=>{
     const [y,m,d]=s.split("-").map(Number);
@@ -137,6 +165,8 @@ function render(){
 }
 
 render();
+["ad","ch","rm"].forEach(id =>
+  document.getElementById(id).addEventListener("input", render));
 setInterval(render, 60000);
 </script>
 </body>
