@@ -33,6 +33,15 @@ PAGE_URL = f"{SITE}/#/search/devices?keyword={urllib.parse.quote(KEYWORD, safe='
 
 STATE_FILE = os.path.join("docs", "data", "parking_seen.json")
 
+# 車位頁要登入才看得到。實測未登入時 app 讀不到 token，router 會把
+# #/search/devices 收掉丟回登入頁，連一個資料請求都不會發。這裡吃一份
+# 從自己瀏覽器複製出來的登入狀態，開頁前先塞回去。
+SESSION_BLOB = os.environ.get("INNOKNIGHT_SESSION") or ""
+
+# 判斷有沒有被擋在登入牆外面
+LOGIN_WORDS = ("會員登入", "手機登入", "忘記密碼", "註冊", "登入",
+               "login", "sign in", "log in")
+
 LINE_CLIENT_ID = os.environ.get("LINE_CLIENT_ID")
 LINE_CLIENT_SECRET = os.environ.get("LINE_CLIENT_SECRET")
 
@@ -214,6 +223,82 @@ def probe():
 
 # === 用真實瀏覽器載入頁面，並側錄它打的每一支 API ===
 
+def parse_session(blob):
+    """把 INNOKNIGHT_SESSION 這份 secret 拆成可以塞回瀏覽器的東西。
+
+    刻意吃得寬鬆一點，因為這份東西是人從瀏覽器 console 複製出來的：
+
+      {"key": "值", ...}                         → 整包當 localStorage
+      {"localStorage": {...},
+       "sessionStorage": {...},
+       "cookies": "a=b; c=d" 或 [{name,value}]}  → 各自對號入座
+
+    回傳 (local_items, session_items, cookies)。解析不出來就回三個空的，
+    呼叫端自己決定要不要繼續。
+    """
+    if not blob.strip():
+        return {}, {}, []
+
+    try:
+        data = json.loads(blob)
+    except Exception as e:
+        print(f"  INNOKNIGHT_SESSION 不是合法 JSON（{e}），當作沒設定。")
+        return {}, {}, []
+
+    if not isinstance(data, dict):
+        print("  INNOKNIGHT_SESSION 不是物件，當作沒設定。")
+        return {}, {}, []
+
+    structured = any(k in data for k in ("localStorage", "sessionStorage", "cookies"))
+    if structured:
+        local = data.get("localStorage") or {}
+        session = data.get("sessionStorage") or {}
+        raw_cookies = data.get("cookies") or []
+    else:
+        local, session, raw_cookies = data, {}, []
+
+    def as_str_map(d):
+        if not isinstance(d, dict):
+            return {}
+        # localStorage 的值一定是字串，物件要先 dump 回去才塞得進去
+        return {
+            str(k): v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+            for k, v in d.items()
+        }
+
+    cookies = []
+    host = urllib.parse.urlparse(SITE).hostname
+    if isinstance(raw_cookies, str):
+        # document.cookie 的格式："a=b; c=d"
+        for pair in raw_cookies.split(";"):
+            if "=" not in pair:
+                continue
+            name, _, value = pair.partition("=")
+            cookies.append({"name": name.strip(), "value": value.strip(),
+                            "domain": host, "path": "/"})
+    elif isinstance(raw_cookies, list):
+        for c in raw_cookies:
+            if not isinstance(c, dict) or "name" not in c:
+                continue
+            c = dict(c)
+            c.setdefault("domain", host)
+            c.setdefault("path", "/")
+            cookies.append(c)
+
+    return as_str_map(local), as_str_map(session), cookies
+
+
+def looks_like_login(text, url):
+    """判斷這一頁是不是被踢回登入牆。
+
+    兩個條件都要成立才算，避免正常頁面上剛好有「登出」之類的字就誤判：
+    網址沒走到查詢路由，而且畫面上出現登入頁才有的字樣。
+    """
+    if "search" in (url or ""):
+        return False
+    return any(w in (text or "") for w in LOGIN_WORDS)
+
+
 def render_page(out_dir=None, settle_ms=6000):
     """開一顆 Chromium 把 SPA 載完。
 
@@ -238,13 +323,43 @@ def render_page(out_dir=None, settle_ms=6000):
     # 圖片字體之類的靜態資源不用收，其餘一律收——資料不一定走 xhr/fetch
     SKIP_TYPES = ("image", "font", "stylesheet", "media")
 
+    local_items, session_items, cookies = parse_session(SESSION_BLOB)
+    diag["session"] = {
+        "localStorage_keys": sorted(local_items),
+        "sessionStorage_keys": sorted(session_items),
+        "cookie_names": sorted(c["name"] for c in cookies),
+    }
+    if local_items or session_items or cookies:
+        print(f"  帶入登入狀態：localStorage {len(local_items)} 筆、"
+              f"sessionStorage {len(session_items)} 筆、cookie {len(cookies)} 個")
+    else:
+        print("  沒有 INNOKNIGHT_SESSION，會以未登入狀態開頁（車位頁大概會被擋）。")
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(args=["--disable-gpu", "--no-sandbox"])
-        page = browser.new_page(
+        context = browser.new_context(
             user_agent=BROWSER_UA,
             viewport={"width": 430, "height": 900},
             locale="zh-TW",
         )
+        if cookies:
+            try:
+                context.add_cookies(cookies)
+            except Exception as e:
+                print(f"  塞 cookie 失敗：{type(e).__name__}: {e}")
+        if local_items or session_items:
+            # 一定要在頁面自己的 script 跑之前寫進去：app 是在 created
+            # 階段讀 token 的，晚一步就已經被判定沒登入了
+            context.add_init_script(
+                "(() => {\n"
+                "  const L = __LOCAL__, S = __SESSION__;\n"
+                "  try { for (const k in L) localStorage.setItem(k, L[k]); } catch (e) {}\n"
+                "  try { for (const k in S) sessionStorage.setItem(k, S[k]); } catch (e) {}\n"
+                "})();"
+                .replace("__LOCAL__", json.dumps(local_items, ensure_ascii=False))
+                .replace("__SESSION__", json.dumps(session_items, ensure_ascii=False))
+            )
+        page = context.new_page()
 
         def on_response(resp):
             req = resp.request
@@ -317,6 +432,10 @@ def render_page(out_dir=None, settle_ms=6000):
             text = page.inner_text("body")
         except Exception as e:
             text = f"(取不到 body 文字: {e})"
+
+        diag["auth"] = "login_wall" if looks_like_login(text, final_url) else "ok"
+        if diag["auth"] == "login_wall":
+            print("  ⚠️ 被擋在登入頁，沒有拿到車位資料。")
         try:
             html = page.content()
         except Exception:
@@ -337,6 +456,7 @@ def render_page(out_dir=None, settle_ms=6000):
             except Exception as e:
                 print(f"  截圖失敗：{e}")
 
+        context.close()
         browser.close()
 
     if title:
@@ -350,6 +470,15 @@ def probe_browser(out_dir="probe_out"):
     print("=" * 70)
 
     calls, text, _, diag = render_page(out_dir=out_dir)
+
+    print(f"\n### 登入狀態")
+    sess = diag.get("session", {})
+    print(f"  帶入的 localStorage key：{sess.get('localStorage_keys') or '（無）'}")
+    print(f"  帶入的 cookie：{sess.get('cookie_names') or '（無）'}")
+    if diag.get("auth") == "login_wall":
+        print("  ❌ 被擋在登入頁 —— 沒登入就看不到車位，請設定 INNOKNIGHT_SESSION")
+    else:
+        print("  ✅ 沒有被踢回登入頁")
 
     print(f"\n### 導覽過程")
     for n in diag.get("nav", []):
@@ -553,6 +682,39 @@ def run_monitor(force_notify=False):
     # 也把現場存成檔案上傳成 artifact，判讀出問題時才有 HTML 與截圖可看
     calls, text, _, diag = render_page(out_dir="probe_out")
     print(f"  側錄到 {len(calls)} 個請求，畫面文字 {len(text)} 字")
+
+    if diag.get("auth") == "login_wall":
+        # 登入狀態過期跟「欄位認不出來」是兩回事，要分開講，不然看 log 的人
+        # 會往錯的方向修。這種情況只要換一份 secret 就好。
+        print("被擋在登入頁：INNOKNIGHT_SESSION 沒設定或已經過期。")
+        print("  這一輪不通知也不更新狀態。請重新複製一份登入狀態更新 secret。")
+        print(f"  [page text] {text[:600]!r}")
+        for m in diag.get("console", [])[:10]:
+            print(f"  [console] {m}")
+
+        state = load_state()
+        # 過期只提醒一次，不然每輪都發一則很吵
+        if not state.get("auth_alert"):
+            state["auth_alert"] = stamp
+            save_state(state)
+            token = get_line_token()
+            if token:
+                send_line_broadcast(
+                    token,
+                    f"🔑 車位監控要重新登入\n"
+                    f"📅 {stamp}\n"
+                    f"存的登入狀態已失效，監控暫停中。\n"
+                    f"請更新 GitHub secret INNOKNIGHT_SESSION 後恢復。"
+                )
+        else:
+            print(f"  （{state['auth_alert']} 已經提醒過一次，這輪不重複發）")
+        return 0
+
+    # 登入狀態是好的，把過期旗標清掉，下次真的過期才會再提醒
+    state = load_state()
+    if state.get("auth_alert"):
+        state.pop("auth_alert")
+        save_state(state)
 
     devices = extract_devices(calls, text)
     report_devices(devices)
