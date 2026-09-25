@@ -51,8 +51,17 @@ DIGEST_HOUR_JST = 8
 DIGEST_DETAIL_LIMIT = 8
 
 ROOMS_NUM = 1
-ADULT_NUM = 2
-CHILD_NUM = 0
+ADULT_NUM = 2       # 官網定義「大人」為 18 歲以上
+CHILD_NUM = 1       # 女兒 7 歲，官網算「子ども」
+
+# 官網搜尋表單在有小孩時會帶上年齡與床位需求，編碼在這個參數裡。
+# 公開資料查不到格式，官網也連不上無法實測，所以先留空。
+# 若搜尋結果與官網手動查詢不一致，就到官網做一次「2 大 1 小」搜尋，
+# 把結果頁網址裡 childAgeBedInform 的值複製過來。
+CHILD_AGE_BED_INFORM = ""
+
+# 小孩年齡，只用於顯示，讓通知裡看得出查的是什麼條件
+CHILD_AGES = [7]
 
 # searchHotelCD 對照（迪士尼直營飯店）
 HOTELS = [
@@ -83,6 +92,12 @@ READY_MARKERS = (
     "円", "満室", "空室", "プラン", "予約",
     "見つかりませんでした", "受け付けておりません",
 )
+
+# 官網忙碌時會把人送進 Queue-it 等候室。排隊本來就該讓程式去等，
+# 所以遇到等候室就掛在那裡直到放行（Queue-it 會自己轉址回來）。
+# 放行後 cookie 會留在同一個瀏覽器 context，後續日期不必重新排隊。
+QUEUE_MAX_WAIT_MS = 20 * 60 * 1000   # 最多陪等 20 分鐘
+QUEUE_POLL_MS = 5000
 
 # 診斷輸出：頁面判讀不出來時，印出前幾筆的實際內容供除錯
 DIAGNOSTIC_SAMPLES = 2
@@ -230,6 +245,16 @@ def humanize_delta(delta):
 
 # === 空房查詢 ===
 
+def occupancy_text():
+    """人數條件的文字描述，放進通知讓人一眼看出查的是什麼條件。"""
+    parts = [f"{ADULT_NUM} 大人"]
+    if CHILD_NUM:
+        ages = "、".join(f"{a} 歲" for a in CHILD_AGES[:CHILD_NUM])
+        parts.append(f"{CHILD_NUM} 小孩（{ages}）" if ages else f"{CHILD_NUM} 小孩")
+    parts.append(f"{ROOMS_NUM} 房")
+    return " / ".join(parts)
+
+
 def build_search_url(hotel_cd, use_date, staying_days):
     params = [
         ("showWay", ""),
@@ -239,7 +264,7 @@ def build_search_url(hotel_cd, use_date, staying_days):
         ("stayingDays", str(staying_days)),
         ("useDate", use_date.strftime("%Y%m%d")),
         ("cpListStr", ""),
-        ("childAgeBedInform", ""),
+        ("childAgeBedInform", CHILD_AGE_BED_INFORM),
         ("searchHotelCD", hotel_cd),
         ("searchHotelDiv", ""),
         ("hotelName", ""),
@@ -399,14 +424,63 @@ def extract_prices(text):
     return sorted(set(values))
 
 
+def in_queue(page):
+    """目前是否被擋在 Queue-it 等候室。"""
+    try:
+        if "reserve-q." in (page.url or "").lower():
+            return True
+        text = page.inner_text("body")
+    except Exception:
+        return False
+    lower = text.lower()
+    return any(pat in lower or pat in text for pat in QUEUE_PATTERNS)
+
+
+def wait_out_queue(page, url):
+    """在等候室排隊直到放行。
+
+    Queue-it 輪到就會自己轉址回官網，所以這裡只要等著。
+    這正是自動化該做的事——讓程式去等，而不是讓人盯著進度條。
+    回傳 True 表示已放行，False 表示等超過上限。
+    """
+    if not in_queue(page):
+        return True
+
+    print(f"  ⏳ 進入等候室排隊（最多等 {QUEUE_MAX_WAIT_MS // 60000} 分鐘）……")
+    waited = 0
+    while waited < QUEUE_MAX_WAIT_MS:
+        page.wait_for_timeout(QUEUE_POLL_MS)
+        waited += QUEUE_POLL_MS
+        if not in_queue(page):
+            print(f"  ✅ 排隊結束（等了 {waited // 1000} 秒），繼續查詢。")
+            # 放行後可能停在首頁，重新導向原本要查的網址
+            try:
+                if "hotel/list" not in (page.url or ""):
+                    page.goto(url, wait_until="domcontentloaded",
+                              timeout=PAGE_TIMEOUT_MS)
+            except Exception as e:
+                print(f"  ! 排隊後重新載入失敗：{str(e).splitlines()[0]}")
+            return True
+        if waited % 60000 == 0:
+            print(f"     仍在排隊……已等 {waited // 60000} 分鐘")
+
+    print(f"  ⚠️ 排隊超過 {QUEUE_MAX_WAIT_MS // 60000} 分鐘仍未放行，放棄這一輪。")
+    return False
+
+
 def load_search_page(page, url):
     """載入搜尋結果頁並回傳頁面文字。
 
     不使用 wait_until="networkidle"：官網背景有持續的請求，這個條件
     實際上永遠不會成立（實測整批 60 秒逾時）。改為等 DOM 就緒，
     再輪詢頁面文字直到出現價格／滿室等關鍵字。
+
+    若被送進等候室，會先排完隊再繼續。
     """
     page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+
+    if not wait_out_queue(page, url):
+        return page.inner_text("body") if page else ""
 
     waited = 0
     text = ""
@@ -608,7 +682,7 @@ def render_scan_report(rows, start_date, days, staying_days):
 
     lines = []
     lines.append(f"掃描區間：{start_date} 起 {days} 天，每次 {staying_days} 晚，"
-                 f"{ADULT_NUM} 大人 / {ROOMS_NUM} 房")
+                 f"{occupancy_text()}")
     lines.append("")
     header = f"{'日期':<14}"
     for cd in hotel_codes:
@@ -832,9 +906,19 @@ def render_newly(rows, newly):
 
 # === Main ===
 
+def parse_dates_arg(argv):
+    """--dates 2027-01-30,2027-01-31：只查指定日期。"""
+    if "--dates" not in argv:
+        return None
+    raw = argv[argv.index("--dates") + 1]
+    return [datetime.datetime.strptime(d.strip(), "%Y-%m-%d").date()
+            for d in raw.split(",") if d.strip()]
+
+
 def main():
     send_line = "--no-line" not in sys.argv
     force_notify = "--force-notify" in sys.argv
+    only_dates = parse_dates_arg(sys.argv)
 
     now = datetime.datetime.now(tz=JST)
     now_text = now.strftime("%Y-%m-%d %H:%M JST")
@@ -845,8 +929,18 @@ def main():
     notified = set(state.get("notified", []))
     blocked_streak = int(state.get("blocked_streak", 0))
 
-    dates = open_target_dates(now)
-    pending = [d for d in target_dates() if d not in dates]
+    if only_dates:
+        # 指定日期時仍然跳過未開賣的，查了也只會看到「未開放預約」
+        dates = [d for d in only_dates if now >= reservation_open_at(d)]
+        skipped = [d for d in only_dates if d not in dates]
+        if skipped:
+            print(f"以下日期尚未開賣，略過：" +
+                  "、".join(f"{d}（{reservation_open_at(d):%m/%d %H:%M} JST 開）"
+                            for d in skipped))
+        pending = []
+    else:
+        dates = open_target_dates(now)
+        pending = [d for d in target_dates() if d not in dates]
 
     print(f"監控區間 {TARGET_START} ~ {TARGET_END}：已開賣 {len(dates)} 天、"
           f"未開賣 {len(pending)} 天；飯店 {MONITOR_HOTELS}")
@@ -935,7 +1029,7 @@ def main():
     parts.append(f"🏰 東京迪士尼飯店空房監控")
     parts.append(f"📅 報告時間：{now_text}")
     parts.append(f"🛏 監控區間：{TARGET_START:%Y/%m/%d} ~ {TARGET_END:%m/%d}"
-                 f"（每日單晚，{ADULT_NUM} 大人 / {ROOMS_NUM} 房）")
+                 f"（每日單晚，{occupancy_text()}）")
     parts.append("━━━━━━━━━━━━━━━━━━")
 
     if not dates:
@@ -1016,7 +1110,7 @@ def run_urls(argv):
     hotel_names = dict(HOTELS)
     print(f"共 {len(dates) * len(codes)} 個網址"
           f"（{len(dates)} 個日期 x {len(codes)} 間飯店，每次 {nights} 晚，"
-          f"{ADULT_NUM} 大人 / {ROOMS_NUM} 房）\n")
+          f"{occupancy_text()}）\n")
     for d in dates:
         open_at = reservation_open_at(d)
         state = "可查" if now >= open_at else f"未開賣（{open_at:%m/%d %H:%M} JST 開）"
