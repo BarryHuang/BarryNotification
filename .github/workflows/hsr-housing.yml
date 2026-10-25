@@ -1,0 +1,76 @@
+name: HSR Housing & Rental Yield
+
+on:
+  schedule:
+    # 台灣時間每天約 08:00 起跑（GitHub 排程常延遲 1~2 小時）
+    # 刻意跟 hsinchu-housing（UTC 23:00）錯開，避免兩個 job 同時 push main
+    - cron: '30 0 * * *'
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: '重建比對基準（不列新成交）'
+        type: boolean
+        default: false
+      rebuild:
+        description: '忽略既有 store，重抓所有季別（慢，約 125MB）'
+        type: boolean
+        default: false
+      no_notify:
+        description: '只產表，不發 LINE'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hsr-housing
+  cancel-in-progress: false
+
+jobs:
+  build-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # docs/data/hsr_store.json.gz 已經含有歷史季別的篩選結果，所以平常這一步
+      # 只會抓本期檔的 6 個小檔（約 15 秒）。只有換季或 rebuild 時才會下載季別檔。
+      - name: Build report and notify
+        env:
+          LINE_CLIENT_ID: ${{ secrets.LINE_CLIENT_ID }}
+          LINE_CLIENT_SECRET: ${{ secrets.LINE_CLIENT_SECRET }}
+          HSR_SITE_URL: https://barryhuang.github.io/BarryNotification/hsr.html
+        run: |
+          python hsr_housing.py \
+            ${{ inputs.seed && '--seed' || '' }} \
+            ${{ inputs.rebuild && '--rebuild' || '' }} \
+            ${{ inputs.no_notify && '--no-notify' || '' }}
+
+      - name: Commit updated report
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs
+          if git diff --cached --quiet; then
+            echo "報表無變動，不需 commit。"
+            exit 0
+          fi
+          git commit -m "更新高鐵站房價租金報表 $(date -u +'%Y-%m-%d')"
+          # 另一個排程（新竹房價）也會 push main，撞到就 rebase 重試
+          for i in 1 2 3 4; do
+            if git push; then
+              exit 0
+            fi
+            echo "push 失敗，第 $i 次重試前先 rebase"
+            sleep $((2 ** i))
+            git pull --rebase origin main || exit 1
+          done
+          echo "push 連續失敗四次" >&2
+          exit 1
