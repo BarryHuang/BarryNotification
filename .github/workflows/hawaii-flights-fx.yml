@@ -1,0 +1,55 @@
+name: Hawaii Flights & USD Rate
+
+on:
+  schedule:
+    # 台灣時間每天約 07:00 起跑（GitHub 排程常延遲 1~2 小時）。
+    # 刻意避開整點，整點是全平台最擠、最容易被丟掉的時刻。
+    - cron: '17 23 * * *'
+  workflow_dispatch:
+    inputs:
+      no_notify:
+        description: '只在 log 印出訊息，不發 LINE、不寫歷史（測試用）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hawaii-flights-fx
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check fares and rate, notify
+        env:
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          LINE_CLIENT_ID: ${{ secrets.LINE_CLIENT_ID }}
+          LINE_CLIENT_SECRET: ${{ secrets.LINE_CLIENT_SECRET }}
+        run: |
+          python hawaii_flights_fx.py ${{ inputs.no_notify && '--no-notify' || '' }}
+
+      # 每日票價與匯率留在 repo 裡，隔天才能算「比昨天」與「監控以來最低」
+      - name: Persist history
+        if: ${{ !inputs.no_notify }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/data/hawaii_flights.json
+          if git diff --cached --quiet; then
+            echo "歷史無變動，不需 commit。"
+          else
+            git commit -m "更新夏威夷機票與匯率 $(date -u +'%Y-%m-%d')"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
