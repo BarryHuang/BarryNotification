@@ -66,6 +66,11 @@ COST_RATIO = float(os.environ.get("HSR_COST_RATIO", "0.25"))  # 持有成本占�
 HOLD_YEARS = int(os.environ.get("HSR_HOLD_YEARS", "20"))      # 持有幾年後賣出
 RENT_GROWTH = float(os.environ.get("HSR_RENT_GROWTH", "0.0"))
 BENCH_RATE = float(os.environ.get("HSR_BENCH_RATE", "0.02"))  # 對照基準，預設當定存／債券
+SELL_FEE_PCT = float(os.environ.get("HSR_SELL_FEE_PCT", "0.04"))  # 賣出的仲介與代書費
+
+# 房地合一稅 2.0（境內居住者個人），按持有年數的稅率。課稅基礎是「獲利」而不是
+# 售價，所以房價不漲就不用繳——這也意味著它只在這筆投資真的賺錢時才咬一口。
+LAND_TAX = ((2, 0.45), (5, 0.35), (10, 0.20), (10 ** 9, 0.15))
 
 # 住宅型態。店面、辦公、工廠、套房的價格與租金邏輯不同，不混進來。
 SALE_TYPES = ("住宅大樓", "華廈")
@@ -303,18 +308,24 @@ def quartiles(v):
     return v[len(v) // 4], v[len(v) * 3 // 4]
 
 
-def amortise(principal, months=12):
-    """本息均攤：回傳 (月付, 前 months 個月的利息合計, 本金合計)。"""
+def amortise_balance(principal, months):
+    """本息均攤：回傳 (月付, 利息合計, 本金合計, 期末餘額)。"""
     i = LOAN_RATE / 12
     n = LOAN_YEARS * 12
     pay = principal / n if i <= 0 else principal * i / (1 - (1 + i) ** (-n))
     bal, interest, principal_paid = principal, 0.0, 0.0
-    for _ in range(months):
+    for _ in range(min(months, n)):
         it = bal * i
         pr = pay - it
         interest += it
         principal_paid += pr
         bal -= pr
+    return pay, interest, principal_paid, max(bal, 0.0)
+
+
+def amortise(principal, months=12):
+    """本息均攤：回傳 (月付, 前 months 個月的利息合計, 本金合計)。"""
+    pay, interest, principal_paid, _ = amortise_balance(principal, months)
     return pay, interest, principal_paid
 
 
@@ -335,14 +346,41 @@ def _irr(cashflows):
     return (lo + hi) / 2
 
 
+def land_tax_rate(years):
+    for limit, rate in LAND_TAX:
+        if years <= limit:
+            return rate
+    return LAND_TAX[-1][1]
+
+
+def net_sale_proceeds(full_wan, appreciation, years=None):
+    """期末賣出的淨入袋：售價 − 仲介代書 − 房地合一稅。單位：元。
+
+    房地合一稅課的是獲利（售價 − 取得成本 − 費用），不是售價，所以房價不漲
+    就不用繳。沒有扣「土地漲價總數額」——那要查公告土地現值，這裡算不出來；
+    少扣這一項會讓稅偏高，屬於保守估計。土地增值稅同樣未計。
+    """
+    years = HOLD_YEARS if years is None else years
+    price = full_wan * 10000 * (1 + appreciation) ** years
+    sell_fee = price * SELL_FEE_PCT
+    cost = full_wan * 10000 * (1 + FEE_PCT)      # 取得成本含當初的契稅代書
+    gain = price - cost - sell_fee
+    tax = max(0.0, gain) * land_tax_rate(years)
+    return price - sell_fee - tax, tax
+
+
 def _lifecycle_cf(full_wan, rent_month, appreciation):
-    """期初自備＋雜費、每月租金淨額減月付、期末賣出。單位：元。"""
+    """期初自備＋雜費、每月租金淨額減月付、期末賣出淨額。單位：元。"""
     pay, _, _ = amortise(full_wan * (1 - DOWN_PCT) * 10000, months=1)
     cf = [-full_wan * (DOWN_PCT + FEE_PCT) * 10000]
     for m in range(1, HOLD_YEARS * 12 + 1):
         rent = rent_month * (1 + RENT_GROWTH) ** ((m - 1) / 12)
         cf.append(rent * (1 - COST_RATIO) - (pay if m <= LOAN_YEARS * 12 else 0))
-    cf[-1] += full_wan * 10000 * (1 + appreciation) ** HOLD_YEARS
+    # 賣出時貸款還沒繳完的話，餘額要一次清掉
+    _, _, _, balance = amortise_balance(full_wan * (1 - DOWN_PCT) * 10000,
+                                        min(HOLD_YEARS, LOAN_YEARS) * 12)
+    proceeds, _ = net_sale_proceeds(full_wan, appreciation)
+    cf[-1] += proceeds - balance
     return cf
 
 
