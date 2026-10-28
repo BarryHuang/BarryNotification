@@ -54,6 +54,13 @@ MIN_N = int(os.environ.get("HSR_MIN_N", "8"))                  # 低於此筆數
 STALE_DAYS = int(os.environ.get("HSR_STALE_DAYS", "75"))       # 超過此天數視為來源停更
 ROOMS = (2, 3, 4)
 
+# 資金試算的假設。自備款比例是最該自己改的一個：投資用的第二戶以上會受央行
+# 信用管制，成數比自住低得多，實際要問銀行。利率與年限給一般水準當基準。
+DOWN_PCT = float(os.environ.get("HSR_DOWN_PCT", "0.4"))   # 自備款占總價
+FEE_PCT = float(os.environ.get("HSR_FEE_PCT", "0.02"))    # 契稅、代書、仲介等雜費占總價
+LOAN_RATE = float(os.environ.get("HSR_LOAN_RATE", "0.025"))
+LOAN_YEARS = int(os.environ.get("HSR_LOAN_YEARS", "30"))
+
 # 住宅型態。店面、辦公、工廠、套房的價格與租金邏輯不同，不混進來。
 SALE_TYPES = ("住宅大樓", "華廈")
 RENT_TYPES = ("住宅大樓", "華廈", "公寓")
@@ -135,11 +142,15 @@ def sale_row(r, station, cfg, season):
             - lvr.num(r.get("車位移轉總面積平方公尺"))) / lvr.PING
     built = lvr.roc_to_ad(r.get("建築完成年月")) or ""
     addr = r.get("土地位置建物門牌") or ""
-    # 欄位只留報表與統計真的會用到的，store 每天 commit，能省就省
+    # 欄位只留報表與統計真的會用到的，store 每天 commit，能省就省。
+    # 總價萬 扣掉車位，用來跟同樣扣掉車位的單價配對；全額萬 是含車位的實付
+    # 金額，回答「要投入多少錢」要用後者——車位佔總價一成多，不能省略。
     return {
         "站": station, "季": season, "日": deal, "路": road, "房": room,
         "門牌": addr[-20:], "坪": round(area, 1),
         "總價萬": round((total - park) / 10000),
+        "全額萬": round(total / 10000),
+        "車位萬": round(park / 10000),
         "單價": up, "屋齡": lvr.house_age(built, deal),
         "編號": (r.get("編號") or "").strip(),
     }
@@ -280,6 +291,35 @@ def quartiles(v):
     return v[len(v) // 4], v[len(v) * 3 // 4]
 
 
+def monthly_payment(principal_wan):
+    """本息均攤的月付金（元）。principal_wan 以萬元計。"""
+    p = principal_wan * 10000
+    i = LOAN_RATE / 12
+    n = LOAN_YEARS * 12
+    if i <= 0:
+        return p / n
+    return p * i / (1 - (1 + i) ** (-n))
+
+
+def funding(full_wan, rent_month):
+    """把總價換成「要準備多少錢」與「每月進出多少」。"""
+    down = full_wan * DOWN_PCT
+    fee = full_wan * FEE_PCT
+    loan = full_wan - down
+    pay = monthly_payment(loan)
+    out = {
+        "全額萬": round(full_wan),
+        "自備萬": round(down),
+        "雜費萬": round(fee),
+        "入手資金萬": round(down + fee),
+        "貸款萬": round(loan),
+        "月付": round(pay),
+    }
+    if rent_month:
+        out["月現金流"] = round(rent_month - pay)
+    return out
+
+
 def analyse(sales, rents):
     """回傳 {站: {房數: {...}}}，以及各站的整體摘要。"""
     price_seasons = set(lvr.recent_seasons(SALE_SEASONS)[-PRICE_WINDOW:])
@@ -295,10 +335,17 @@ def analyse(sales, rents):
                 ups = [d["單價"] for d in sa]
                 lo, hi = quartiles(ups)
                 ages = [d["屋齡"] for d in sa if d["屋齡"] is not None]
+                fulls = [d.get("全額萬", d["總價萬"]) for d in sa]
+                flo, fhi = quartiles(fulls)
+                parks = [d.get("車位萬", 0) for d in sa if d.get("車位萬")]
                 cell.update({
                     "單價": med(ups), "單價四分位": [lo, hi],
                     "坪數": med([d["坪"] for d in sa]),
                     "總價萬": round(statistics.median(d["總價萬"] for d in sa)),
+                    "全額萬": round(statistics.median(fulls)),
+                    "全額四分位": [round(flo), round(fhi)],
+                    "車位萬": round(statistics.median(parks)) if parks else 0,
+                    "有車位": round(100 * len(parks) / len(sa)),
                     "屋齡": med(ages) if ages else None,
                 })
             if len(rc) >= MIN_N:
@@ -311,6 +358,8 @@ def analyse(sales, rents):
                 y = cell["每坪租金"] * 12 / (cell["單價"] * 10000) * 100
                 cell["投報率"] = round(y, 2)
                 cell["回本年"] = round(100 / y)
+            if cell.get("全額萬"):
+                cell["資金"] = funding(cell["全額萬"], cell.get("月租"))
             # 逐季中位數。單季筆數少時中位數會跳動（實測竹北 3 房從 54 到 77
             # 萬/坪），把每季攤出來，讀的人才知道那個總中位數有多穩。
             byq = collections.defaultdict(list)
@@ -371,19 +420,31 @@ def build_message(stats, new_sales, baseline, fresh):
     else:
         lines += ["今日無新成交揭露。", ""]
 
-    lines.append("【各站投報率】房型｜單價｜每坪租金｜年投報")
+    lines.append("【各站行情】總價含車位｜自備%d成+雜費｜年投報" % round(DOWN_PCT * 10))
     for station, rows in stats.items():
         lines.append("◆ %s" % station)
         for room, c in rows.items():
-            if c.get("投報率"):
-                lines.append("  %d房 %.1f萬/坪・%d元/坪・%.2f%%（回本%d年）"
-                             % (room, c["單價"], c["每坪租金"], c["投報率"], c["回本年"]))
-            elif c.get("單價"):
-                lines.append("  %d房 %.1f萬/坪・租金樣本不足（n=%d）"
-                             % (room, c["單價"], c["租賃筆數"]))
-            else:
+            if not c.get("全額萬"):
                 lines.append("  %d房 樣本不足（買賣 n=%d）" % (room, c["買賣筆數"]))
+                continue
+            fd = c["資金"]
+            head = "  %d房 %s萬（%s–%s）→ 入手 %s萬" % (
+                room, format(fd["全額萬"], ","),
+                format(c["全額四分位"][0], ","), format(c["全額四分位"][1], ","),
+                format(fd["入手資金萬"], ","))
+            if c.get("投報率"):
+                cf = fd.get("月現金流")
+                head += "｜%.2f%%" % c["投報率"]
+                lines.append(head)
+                lines.append("       租 %s / 月付 %s = %s%s 元/月"
+                             % (format(c["月租"], ","), format(fd["月付"], ","),
+                                "+" if cf is not None and cf >= 0 else "",
+                                format(cf, ",") if cf is not None else "—"))
+            else:
+                lines.append(head + "｜租金樣本不足(n=%d)" % c["租賃筆數"])
     lines.append("")
+    lines.append("※ 自備%d成、利率%.2f%%、%d年試算；投資用第二戶以上成數會更低"
+                 % (round(DOWN_PCT * 10), LOAN_RATE * 100, LOAN_YEARS))
     if latest:
         lines.append("資料涵蓋到 %s（落後 %d 天）" % (latest, lag))
     lines.append("完整報表 " + SITE_URL)
@@ -403,6 +464,35 @@ def bar(pct, lo, hi):
     w = max(0.0, min(100.0, (pct - lo) / (hi - lo) * 100))
     return ('<span class="bar"><i style="width:%.1f%%"></i></span>'
             '<b class="barval">%.2f%%</b>' % (w, pct))
+
+
+def funding_cells(c):
+    """資金那一列：實付總價 → 要準備的現金 → 每月進出。"""
+    fd = c.get("資金")
+    if not fd:
+        return '<span class="dim">資料不足</span>'
+    lo, hi = c["全額四分位"]
+    cells = [
+        ('實付總價', '<b>%s</b> 萬' % format(fd["全額萬"], ","),
+         '四分位 %s–%s' % (format(lo, ","), format(hi, ","))),
+        ('含車位', '%s 萬' % format(c["車位萬"], ","), '%d%% 的物件有車位' % c["有車位"]),
+        ('自備 %d 成' % round(DOWN_PCT * 10), '<b>%s</b> 萬' % format(fd["自備萬"], ","),
+         '加雜費共 %s 萬' % format(fd["入手資金萬"], ",")),
+        ('貸款', '%s 萬' % format(fd["貸款萬"], ","),
+         '%.2f%% · %d 年' % (LOAN_RATE * 100, LOAN_YEARS)),
+        ('月付', '%s 元' % format(fd["月付"], ","), None),
+    ]
+    if fd.get("月現金流") is not None:
+        cf = fd["月現金流"]
+        cells.append(('月現金流',
+                      '<b class="%s">%s%s</b> 元'
+                      % ("cf-neg" if cf < 0 else "cf-pos",
+                         "+" if cf >= 0 else "", format(cf, ",")),
+                      '租金 %s 減月付' % format(c["月租"], ",")))
+    return "".join(
+        '<span class="f"><i>%s</i><span class="fv">%s</span>%s</span>'
+        % (esc(k), v, ('<em>%s</em>' % esc(sub)) if sub else "")
+        for k, v, sub in cells)
 
 
 def render(stats, sales, rents, fresh):
@@ -443,13 +533,15 @@ def render(stats, sales, rents, fresh):
                 '<td class="num">%s</td>'
                 '<td class="num dim">%s<span class="sub">買%d / 租%d</span></td></tr>'
                 '<tr class="qrow"><td colspan="7"><span class="qlab">逐季單價</span>%s</td></tr>'
+                '<tr class="frow"><td colspan="7">%s</td></tr>'
                 % (room, c["單價"], lo, hi, c["坪數"], c["總價萬"],
                    rent_cell,
                    ("%s 元" % format(c["月租"], ",")) if c.get("月租") else "—",
                    yield_cell, payback,
                    ("%.0f 年" % c["屋齡"]) if c.get("屋齡") is not None else "—",
                    c["買賣筆數"], c["租賃筆數"],
-                   trend or '<span class="dim">單季筆數不足</span>'))
+                   trend or '<span class="dim">單季筆數不足</span>',
+                   funding_cells(c)))
 
         recent = sorted((d for d in sales if d["站"] == station),
                         key=lambda d: d["日"], reverse=True)[:8]
