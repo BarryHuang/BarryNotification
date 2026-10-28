@@ -44,6 +44,7 @@ DATA_DIR = os.path.join(OUT_DIR, "data")
 STORE_PATH = os.path.join(DATA_DIR, "hsr_store.json.gz")
 SEEN_PATH = os.path.join(DATA_DIR, "hsr_seen.json")
 SOURCE_PATH = os.path.join(DATA_DIR, "hsr_source.json")
+HISTORY_PATH = os.path.join(DATA_DIR, "hsr_history.json")
 SITE_URL = os.environ.get("HSR_SITE_URL",
                           "https://barryhuang.github.io/BarryNotification/hsr.html")
 
@@ -450,6 +451,7 @@ def funding(full_wan, rent_month, gross_yield=None):
 
 def analyse(sales, rents):
     """回傳 {站: {房數: {...}}}，以及各站的整體摘要。"""
+    history = load_history()
     price_seasons = set(lvr.recent_seasons(SALE_SEASONS)[-PRICE_WINDOW:])
     out = collections.OrderedDict()
     for station in STATIONS:
@@ -494,6 +496,15 @@ def analyse(sales, rents):
                 cell["資金"] = funding(cell["全額萬"], cell.get("月租"),
                                        cell.get("投報率"))
                 cell["長期"] = longrun(cell["全額萬"], cell.get("月租"))
+            hist = history.get("%s|%d" % (station, room))
+            if hist:
+                cg = cagr_of(hist)
+                if cg:
+                    a, b, rate, fy, ly = cg
+                    cell["歷史"] = {"起": round(a, 1), "終": round(b, 1),
+                                    "年化": round(rate, 2),
+                                    "起年": "%d–%d" % fy, "終年": "%d–%d" % ly,
+                                    "累積": round((b / a - 1) * 100)}
             # 逐季中位數。單季筆數少時中位數會跳動（實測竹北 3 房從 54 到 77
             # 萬/坪），把每季攤出來，讀的人才知道那個總中位數有多穩。
             byq = collections.defaultdict(list)
@@ -583,6 +594,11 @@ def build_message(stats, new_sales, baseline, fresh):
                                     ("%+.2f%%" % lr["打平增值"])
                                     if lr.get("打平增值") is not None else "？",
                                     BENCH_RATE * 100))
+                hs = c.get("歷史")
+                if hs and lr.get("打平增值") is not None:
+                    lines.append("       過去實際年化 %+.2f%%（%s→%s）%s"
+                                 % (hs["年化"], hs["起年"], hs["終年"],
+                                    "達標" if hs["年化"] >= lr["打平增值"] else "未達"))
             else:
                 lines.append(head + "｜租金樣本不足(n=%d)" % c["租賃筆數"])
     lines.append("")
@@ -609,6 +625,32 @@ def bar(pct, lo, hi):
     w = max(0.0, min(100.0, (pct - lo) / (hi - lo) * 100))
     return ('<span class="bar"><i style="width:%.1f%%"></i></span>'
             '<b class="barval">%.2f%%</b>' % (w, pct))
+
+
+def load_history():
+    try:
+        with open(HISTORY_PATH, encoding="utf-8") as f:
+            return json.load(f).get("年度", {})
+    except Exception:
+        return {}
+
+
+def cagr_of(series):
+    """年度序列 → (起點均價, 終點均價, 年化漲幅%, 起點區間, 終點區間)。
+
+    單年的中位數會被建案組成帶偏（竹北 3 房在 112→113 看起來掉了三成，隔年
+    又衝回去），所以頭尾各取三年平均再算年化，不直接用單年對單年。
+    """
+    years = sorted(int(y) for y in series)
+    if len(years) < 6:
+        return None
+    first, last = years[:3], years[-3:]
+    a = statistics.mean(series[str(y)]["實付每坪"] for y in first)
+    b = statistics.mean(series[str(y)]["實付每坪"] for y in last)
+    gap = statistics.mean(last) - statistics.mean(first)
+    if a <= 0 or gap <= 0:
+        return None
+    return a, b, ((b / a) ** (1 / gap) - 1) * 100, (first[0], first[-1]), (last[0], last[-1])
 
 
 def funding_cells(c):
@@ -652,6 +694,15 @@ def funding_cells(c):
             cells.append(('打平 %.0f%% 要年漲' % (BENCH_RATE * 100),
                           '<b>%+.2f%%</b>' % lr["打平增值"],
                           '低於這個數就不如定存'))
+    hs = c.get("歷史")
+    if hs:
+        need = (c.get("長期") or {}).get("打平增值")
+        ok = need is not None and hs["年化"] >= need
+        cells.append(('過去實際年化',
+                      '<b class="%s">%+.2f%%</b>'
+                      % ("cf-pos" if ok else "cf-neg", hs["年化"]),
+                      '%s %.1f萬 → %s %.1f萬（%+d%%）'
+                      % (hs["起年"], hs["起"], hs["終年"], hs["終"], hs["累積"])))
     return "".join(
         '<span class="f"><i>%s</i><span class="fv">%s</span>%s</span>'
         % (esc(k), v, ('<em>%s</em>' % esc(sub)) if sub else "")
