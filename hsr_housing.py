@@ -56,10 +56,16 @@ ROOMS = (2, 3, 4)
 
 # 資金試算的假設。自備款比例是最該自己改的一個：投資用的第二戶以上會受央行
 # 信用管制，成數比自住低得多，實際要問銀行。利率與年限給一般水準當基準。
-DOWN_PCT = float(os.environ.get("HSR_DOWN_PCT", "0.4"))   # 自備款占總價
+DOWN_PCT = float(os.environ.get("HSR_DOWN_PCT", "0.3"))   # 自備款占總價
 FEE_PCT = float(os.environ.get("HSR_FEE_PCT", "0.02"))    # 契稅、代書、仲介等雜費占總價
 LOAN_RATE = float(os.environ.get("HSR_LOAN_RATE", "0.025"))
-LOAN_YEARS = int(os.environ.get("HSR_LOAN_YEARS", "30"))
+LOAN_YEARS = int(os.environ.get("HSR_LOAN_YEARS", "20"))
+
+# 長期試算：貸款還完之後才是真正看得出划不划算的地方。
+COST_RATIO = float(os.environ.get("HSR_COST_RATIO", "0.25"))  # 持有成本占租金（稅、管理費、修繕、空置）
+HOLD_YEARS = int(os.environ.get("HSR_HOLD_YEARS", "20"))      # 持有幾年後賣出
+RENT_GROWTH = float(os.environ.get("HSR_RENT_GROWTH", "0.0"))
+BENCH_RATE = float(os.environ.get("HSR_BENCH_RATE", "0.02"))  # 對照基準，預設當定存／債券
 
 # 住宅型態。店面、辦公、工廠、套房的價格與租金邏輯不同，不混進來。
 SALE_TYPES = ("住宅大樓", "華廈")
@@ -312,6 +318,64 @@ def amortise(principal, months=12):
     return pay, interest, principal_paid
 
 
+def _irr(cashflows):
+    """月現金流序列的年化 IRR。二分法，找不到變號區間就回 None。"""
+    def npv(annual):
+        m = (1 + annual) ** (1 / 12) - 1
+        return sum(c / (1 + m) ** t for t, c in enumerate(cashflows))
+    lo, hi = -0.5, 1.0
+    if npv(lo) * npv(hi) > 0:
+        return None
+    for _ in range(120):
+        mid = (lo + hi) / 2
+        if npv(lo) * npv(mid) <= 0:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
+def _lifecycle_cf(full_wan, rent_month, appreciation):
+    """期初自備＋雜費、每月租金淨額減月付、期末賣出。單位：元。"""
+    pay, _, _ = amortise(full_wan * (1 - DOWN_PCT) * 10000, months=1)
+    cf = [-full_wan * (DOWN_PCT + FEE_PCT) * 10000]
+    for m in range(1, HOLD_YEARS * 12 + 1):
+        rent = rent_month * (1 + RENT_GROWTH) ** ((m - 1) / 12)
+        cf.append(rent * (1 - COST_RATIO) - (pay if m <= LOAN_YEARS * 12 else 0))
+    cf[-1] += full_wan * 10000 * (1 + appreciation) ** HOLD_YEARS
+    return cf
+
+
+def longrun(full_wan, rent_month):
+    """貸款還完之後的全期報酬。
+
+    「貸款會還完」確實讓現金流在繳完那年轉正，但那不等於報酬變好——還本金
+    只是把現金換成資產。真正的問題是整筆投資的 IRR，而 IRR 幾乎完全被房價
+    增值決定，因為租金投報率本來就低於貸款利率。所以這裡除了 0% 增值下的
+    IRR，也回推「房價每年要漲多少才打平 BENCH_RATE」，那個數字才是決策點。
+    """
+    if not rent_month:
+        return None
+    base = _irr(_lifecycle_cf(full_wan, rent_month, 0.0))
+    lo, hi = -0.10, 0.20
+    need = None
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        r = _irr(_lifecycle_cf(full_wan, rent_month, mid))
+        if r is None:
+            break
+        if r < BENCH_RATE:
+            lo = mid
+        else:
+            hi = mid
+    else:
+        need = (lo + hi) / 2
+    return {
+        "IRR": round(base * 100, 2) if base is not None else None,
+        "打平增值": round(need * 100, 2) if need is not None else None,
+    }
+
+
 def funding(full_wan, rent_month, gross_yield=None):
     """把總價換成「要準備多少錢」「每月進出多少」「自有資金賺多少」。
 
@@ -391,6 +455,7 @@ def analyse(sales, rents):
             if cell.get("全額萬"):
                 cell["資金"] = funding(cell["全額萬"], cell.get("月租"),
                                        cell.get("投報率"))
+                cell["長期"] = longrun(cell["全額萬"], cell.get("月租"))
             # 逐季中位數。單季筆數少時中位數會跳動（實測竹北 3 房從 54 到 77
             # 萬/坪），把每季攤出來，讀的人才知道那個總中位數有多穩。
             byq = collections.defaultdict(list)
@@ -473,12 +538,20 @@ def build_message(stats, new_sales, baseline, fresh):
                              % (format(c["月租"], ","),
                                 "+" if fd["月損益"] >= 0 else "",
                                 format(fd["月損益"], ","), fd["自有資金報酬"]))
+                lr = c.get("長期") or {}
+                if lr.get("IRR") is not None:
+                    lines.append("       %d年IRR %.2f%%（0%%增值）→ 年漲 %s 才打平 %.0f%%"
+                                 % (HOLD_YEARS, lr["IRR"],
+                                    ("%+.2f%%" % lr["打平增值"])
+                                    if lr.get("打平增值") is not None else "？",
+                                    BENCH_RATE * 100))
             else:
                 lines.append(head + "｜租金樣本不足(n=%d)" % c["租賃筆數"])
     lines.append("")
-    lines.append("※ 自備%d成・利率%.2f%%・%d年。本金算資產不算支出，所以看「租−利息」"
-                 % (round(DOWN_PCT * 10), LOAN_RATE * 100, LOAN_YEARS))
-    lines.append("※ 投報率低於利率就是負槓桿，借錢會壓低自有資金報酬")
+    lines.append("※ 自備%d成・利率%.2f%%・貸%d年・持有%d年・持有成本抓租金%d%%"
+                 % (round(DOWN_PCT * 10), LOAN_RATE * 100, LOAN_YEARS,
+                    HOLD_YEARS, round(COST_RATIO * 100)))
+    lines.append("※ 貸款還完只讓現金流轉正，報酬幾乎全看增值——投報率低於利率")
     if latest:
         lines.append("資料涵蓋到 %s（落後 %d 天）" % (latest, lag))
     lines.append("完整報表 " + SITE_URL)
@@ -529,7 +602,18 @@ def funding_cells(c):
         cells.append(('自有資金報酬', '<b class="%s">%.2f%%</b>'
                       % ("cf-neg" if fd["自有資金報酬"] < 0 else "cf-pos",
                          fd["自有資金報酬"]),
-                      '%s槓桿・利差 %+.2f%%' % (fd["槓桿"], fd["利差"])))
+                      '第一年・%s槓桿 %+.2f%%' % (fd["槓桿"], fd["利差"])))
+    lr = c.get("長期") or {}
+    if lr.get("IRR") is not None:
+        cells.append(('%d 年 IRR' % HOLD_YEARS,
+                      '<b class="%s">%.2f%%</b>'
+                      % ("cf-neg" if lr["IRR"] < BENCH_RATE * 100 else "cf-pos",
+                         lr["IRR"]),
+                      '0%% 增值・含期末賣出'))
+        if lr.get("打平增值") is not None:
+            cells.append(('打平 %.0f%% 要年漲' % (BENCH_RATE * 100),
+                          '<b>%+.2f%%</b>' % lr["打平增值"],
+                          '低於這個數就不如定存'))
     return "".join(
         '<span class="f"><i>%s</i><span class="fv">%s</span>%s</span>'
         % (esc(k), v, ('<em>%s</em>' % esc(sub)) if sub else "")
