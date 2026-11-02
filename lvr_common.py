@@ -134,15 +134,21 @@ def _current_via_csv(codes, kinds):
     for code in codes:
         for kind in kinds:
             url = CURRENT_CSV.format(code=code, kind=kind)
-            st, ctype, data = _get(url)
-            if st is None:
-                print("  · 本期 %s_%s 連不上: %s" % (code, kind, ctype))
-                continue
-            if not looks_like_data(ctype, data):
-                print("  · 本期 %s_%s 回 %s %s %d bytes，不是資料檔"
-                      % (code, kind, st, ctype, len(data)))
-                continue
-            rows = parse_rows(data)
+            rows = None
+            # 官網偶發 connection reset，重試兩次再放棄
+            for attempt in (1, 2, 3):
+                st, ctype, data = _get(url)
+                if st is None:
+                    print("  · 本期 %s_%s 第%d次連不上: %s" % (code, kind, attempt, ctype))
+                    continue
+                if not looks_like_data(ctype, data):
+                    print("  · 本期 %s_%s 回 %s %s %d bytes，不是資料檔"
+                          % (code, kind, st, ctype, len(data)))
+                    break
+                got = parse_rows(data)
+                if got:
+                    rows = got
+                break
             if rows:
                 out[(code, kind)] = rows
     return out

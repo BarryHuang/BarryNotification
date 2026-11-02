@@ -134,22 +134,20 @@ def _num(x):
 
 
 def unit_price(r):
-    """每坪單價（萬元）。自己算而不用檔案的「單價元平方公尺」。
+    """每坪單價（萬元），直接採用檔案的「單價元平方公尺」。
 
-    車位有獨立計價時，檔案的單價已正確排除車位；但車位有面積卻沒計價時，
-    檔案是用含車位的面積去除總價，單價會低估約兩成。那種筆數無法把房屋與
-    車位的價格拆開，所以回 None 由呼叫端排除（實測佔兩成）。
+    已知限制：車位有面積卻沒獨立計價時（約佔兩成），檔案是用含車位的面積去
+    除總價，單價會低估約兩成。
+
+    試過自己算並用同區車位每坪中位推估車位價，但沒有採用，原因有兩個：
+      一是會偏離官方與各房產網站共同的報價基準（實測光埔中位 54.5 → 59.0），
+        對照外部資料時會互相矛盾；
+      二是本檔的「坪數」欄位是含車位的權狀坪數，單價若改成扣車位，
+        坪數 × 單價 就不等於總價，報表會自我矛盾。
+    真正造成通知失真的是分件登記那類離群值，那個由 drop_outliers() 處理。
     """
-    building = _num(r.get("建物移轉總面積平方公尺"))
-    park_area = _num(r.get("車位移轉總面積平方公尺"))
-    park_price = _num(r.get("車位總價元"))
-    if park_area > 0 and park_price <= 0:
-        return None
-    net = building - park_area
-    if net <= 0:
-        return None
-    v = (_num(r.get("總價元")) - park_price) / net * PING / 10000
-    return round(v, 1) if 5 < v < 300 else None
+    v = _num(r.get("單價元平方公尺"))
+    return round(v * PING / 10000, 1) if v > 0 else None
 
 
 # 備註標示這些情形時，單價的基準不可信或不是市場價，直接不收：
@@ -312,7 +310,8 @@ def collect_presale(seasons, extra=None):
                     "棟及號": r.get("棟及號", ""), "門牌": addr,
                     "樓層": "%s/%s" % (r.get("移轉層次", ""), r.get("總樓層數", "")),
                     "坪數": round(float(r.get("建物移轉總面積平方公尺") or 0) / PING, 1),
-                    "總價萬": round(total / 10000), "單價萬每坪": unit_price(r) or "",
+                    "總價萬": round(total / 10000),
+                    "單價萬每坪": unit_price(r) or "",
                 })
     out = dedupe(out)
     out.sort(key=lambda x: (x["區域"], x["成交日"] or ""))
@@ -941,16 +940,22 @@ def _current_via_csv():
     for code in _codes():
         for kind in ("A", "B"):
             url = CURRENT_CSV.format(code=code, kind=kind)
-            st, ctype, data = _get(url)
-            if st is None:
-                print("  · 本期 %s_%s 連不上: %s" % (code, kind, ctype))
-                continue
-            if not _looks_like_data(ctype, data):
-                print("  · 本期 %s_%s 回 %s %s %d bytes，不是資料檔"
-                      % (code, kind, st, ctype, len(data)))
-                continue
-            rows = parse_lvr_csv(data)
-            if rows and any(r.get("交易年月日") for r in rows):
+            rows = None
+            # 官網偶發 connection reset，重試兩次再放棄
+            for attempt in (1, 2, 3):
+                st, ctype, data = _get(url)
+                if st is None:
+                    print("  · 本期 %s_%s 第%d次連不上: %s" % (code, kind, attempt, ctype))
+                    continue
+                if not _looks_like_data(ctype, data):
+                    print("  · 本期 %s_%s 回 %s %s %d bytes，不是資料檔"
+                          % (code, kind, st, ctype, len(data)))
+                    break
+                got = parse_lvr_csv(data)
+                if got and any(r.get("交易年月日") for r in got):
+                    rows = got
+                break
+            if rows:
                 out[(code, kind)] = rows
     return out
 
@@ -1008,8 +1013,16 @@ def fetch_current():
     """回傳本期資料 {(縣市代號, 檔別): 原始列}；兩種取法都失敗時回 {}。"""
     remembered = load_source()
     modes = sorted(CURRENT_MODES, key=lambda m: m[0] != remembered)
+    want = {(c, k) for c in _codes() for k in ("A", "B")}
     for name, fn in modes:
         got = fn()
+        # 部分成功不算成功：少一個縣市檔就會整批新成交漏掉，寧可換另一種取法
+        if got and set(got) != want:
+            print("  · 本期（%s）只拿到 %d/%d 個檔，缺 %s"
+                  % (name, len(got), len(want),
+                     "、".join("%s_%s" % k for k in sorted(want - set(got)))))
+            if name != modes[-1][0]:
+                continue
         if not got:
             continue
         n = sum(len(v) for v in got.values())
