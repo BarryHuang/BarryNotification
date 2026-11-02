@@ -126,12 +126,62 @@ def building_of(addr):
     return (m.group(1) if m else addr).replace("新竹縣竹北市", "").replace("新竹市", "")
 
 
-def unit_price(r):
+def _num(x):
     try:
-        v = float(r.get("單價元平方公尺") or 0)
-    except ValueError:
+        return float(x or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def unit_price(r):
+    """每坪單價（萬元）。自己算而不用檔案的「單價元平方公尺」。
+
+    車位有獨立計價時，檔案的單價已正確排除車位；但車位有面積卻沒計價時，
+    檔案是用含車位的面積去除總價，單價會低估約兩成。那種筆數無法把房屋與
+    車位的價格拆開，所以回 None 由呼叫端排除（實測佔兩成）。
+    """
+    building = _num(r.get("建物移轉總面積平方公尺"))
+    park_area = _num(r.get("車位移轉總面積平方公尺"))
+    park_price = _num(r.get("車位總價元"))
+    if park_area > 0 and park_price <= 0:
         return None
-    return round(v * PING / 10000, 1) if v > 0 else None
+    net = building - park_area
+    if net <= 0:
+        return None
+    v = (_num(r.get("總價元")) - park_price) / net * PING / 10000
+    return round(v, 1) if 5 < v < 300 else None
+
+
+# 備註標示這些情形時，單價的基準不可信或不是市場價，直接不收：
+#   親友／特殊關係 — 非常規交易，實測中位只有市場價的六成
+#   夾層          — 夾層面積沒登記，單價被高估
+NON_MARKET = ("親友", "特殊關係", "夾層")
+
+# 單價偏離同區中位這個倍數以上就不收。土地及建物分件登記、預售屋權利轉售的
+# 總價與面積基準對不上，單價會變成行情的兩倍以上（實測埔頂一路 120~125 萬/坪
+# vs 光埔中位 47 萬）。用區域相對離群值擋，比猜備註文字可靠；實測只剔除 1.8%。
+OUTLIER_HI = float(os.environ.get("OUTLIER_HI", "1.8"))
+OUTLIER_LO = float(os.environ.get("OUTLIER_LO", "0.5"))
+
+
+def drop_outliers(rows):
+    """剔除單價明顯偏離同區中位的筆數，回傳 (保留, 剔除)。"""
+    base = {}
+    for region in REGIONS:
+        ups = [d["單價萬每坪"] for d in rows
+               if d["區域"] == region and d["單價萬每坪"]
+               and any(t in d["型態"] for t in RESIDENTIAL)]
+        if len(ups) >= 20:
+            base[region] = statistics.median(ups)
+    keep, dropped = [], []
+    for d in rows:
+        m = base.get(d["區域"])
+        u = d["單價萬每坪"]
+        if m and u and not (m * OUTLIER_LO <= u <= m * OUTLIER_HI):
+            dropped.append(d)
+        else:
+            keep.append(d)
+    return keep, dropped
 
 
 def addr_range(names):
@@ -201,7 +251,14 @@ def collect_resale(seasons, extra=None):
                 if age is None:
                     skipped += 1
                     continue
-                if age > cfg["max_age"]:
+                # 預售屋完工後交屋的登錄，交易日是當初簽約日，屋齡會是負的。
+                # 那是新成屋，不該被屋齡上限擋掉，但負數也不能當屋齡顯示。
+                if max(age, 0.0) > cfg["max_age"]:
+                    continue
+                if any(k in (r.get("備註") or "") for k in NON_MARKET):
+                    continue
+                up = unit_price(r)
+                if up is None:
                     continue
                 out.append({
                     "區域": region, "季別": s, "成交日": deal, "路段": road,
@@ -211,11 +268,15 @@ def collect_resale(seasons, extra=None):
                     "樓層": "%s/%s" % (r.get("移轉層次", ""), r.get("總樓層數", "")),
                     "格局": "%s房%s廳%s衛" % (r.get("建物現況格局-房", ""), r.get("建物現況格局-廳", ""), r.get("建物現況格局-衛", "")),
                     "坪數": round(float(r.get("建物移轉總面積平方公尺") or 0) / PING, 1),
-                    "總價萬": round(total / 10000), "單價萬每坪": unit_price(r) or "",
-                    "屋齡": age, "完工年月": built, "車位": r.get("車位類別", ""),
+                    "總價萬": round(total / 10000), "單價萬每坪": up,
+                    "屋齡": max(age, 0.0), "預售": age < 0, "完工年月": built, "車位": r.get("車位類別", ""),
                     "備註": (r.get("備註") or "")[:60],
                 })
     out = dedupe(out)
+    out, dropped = drop_outliers(out)
+    if dropped:
+        print("  剔除單價偏離同區中位 %.1f~%.1f 倍的 %d 筆"
+              % (OUTLIER_LO, OUTLIER_HI, len(dropped)))
     out.sort(key=lambda x: (x["區域"], x["成交日"] or ""), reverse=False)
     return out, skipped
 
@@ -1076,7 +1137,9 @@ def main():
 
     seen = load_seen()
     baseline = first_run or not seen
-    new_resale = [d for d in resale if d["編號"] and d["編號"] not in seen]
+    # 中位數只採計住宅型態，新成交清單原本沒跟著做，透天厝與「其他」會跑進來
+    new_resale = [d for d in resale if d["編號"] and d["編號"] not in seen
+                  and any(t in d["型態"] for t in RESIDENTIAL)]
     new_presale = [d for d in presale if d["編號"] and d["編號"] not in seen]
     new_resale.sort(key=lambda d: d["成交日"] or "", reverse=True)
     new_presale.sort(key=lambda d: d["成交日"] or "", reverse=True)
