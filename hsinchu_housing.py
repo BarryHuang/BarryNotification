@@ -226,6 +226,7 @@ def batches_of(code, kind, seasons, extra):
 
 def collect_resale(seasons, extra=None):
     out, skipped = [], 0
+    communities = load_communities()
     codes = {cfg["code"] for cfg in REGIONS.values()}
     for code in sorted(codes):
         for s, rows in batches_of(code, "A", seasons, extra):
@@ -264,6 +265,7 @@ def collect_resale(seasons, extra=None):
                     "區域": region, "季別": s, "成交日": deal, "路段": road,
                     "編號": (r.get("編號") or "").strip(),
                     "社區棟別": building_of(addr), "門牌": addr,
+                    "社區": community_of(addr, communities) or "",
                     "型態": r.get("建物型態", ""), "交易標的": r.get("交易標的", ""),
                     "樓層": "%s/%s" % (r.get("移轉層次", ""), r.get("總樓層數", "")),
                     "格局": "%s房%s廳%s衛" % (r.get("建物現況格局-房", ""), r.get("建物現況格局-廳", ""), r.get("建物現況格局-衛", "")),
@@ -339,6 +341,7 @@ OUT_DIR = os.path.join(HERE, "docs")
 DATA_DIR = os.path.join(OUT_DIR, "data")
 STATE_PATH = os.path.join(DATA_DIR, "seen.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "history.json")
+COMMUNITY_PATH = os.path.join(DATA_DIR, "communities.json")
 SOURCE_PATH = os.path.join(DATA_DIR, "source.json")   # 記住上次抓成功的本期端點
 HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "60"))
 # 實價登錄申報後約 30 天才揭露，最新成交日正常落後 10~40 天；超過這個天數視為來源停更
@@ -705,6 +708,31 @@ _ctx.check_hostname = False
 _ctx.verify_mode = ssl.CERT_NONE
 
 
+def load_communities():
+    """門牌前綴 → 社區名。實價登錄查不到社區名，這是人工對照表。
+
+    成屋檔沒有建案名稱欄位；預售檔有名稱，但八成的門牌只有路名沒有號，
+    所以兩邊 join 不起來（實測 13 個門牌 0 命中）。只能人工累積。
+    信心欄位不是裝飾：留空的名稱代表還沒確認，不會顯示。
+    """
+    try:
+        with open(COMMUNITY_PATH, encoding="utf-8") as f:
+            raw = json.load(f).get("對照", {})
+    except Exception:
+        return []
+    out = [(k, v.get("名稱", "").strip()) for k, v in raw.items()
+           if isinstance(v, dict) and v.get("名稱", "").strip()]
+    # 由長到短比對，較精確的門牌優先
+    return sorted(out, key=lambda kv: -len(kv[0]))
+
+
+def community_of(addr, table):
+    for prefix, name in table:
+        if prefix in addr:
+            return name
+    return None
+
+
 def load_seen():
     try:
         with open(STATE_PATH, encoding="utf-8") as f:
@@ -843,9 +871,14 @@ def build_message(new_resale, new_presale, resale, baseline=False, fresh=(None, 
                 size = ("%.0f–%.0f坪" % (sizes[0], sizes[-1])) if len(sizes) > 1 else (
                     ("%.0f坪" % sizes[0]) if sizes else "")
                 n = ("×%d筆 " % len(v)) if len(v) > 1 else ""
+                # 有人工對照到社區名就以社區名為主，門牌放括號裡
+                label = name
+                comm = next((x["社區"] for x in v if x.get("社區")), "")
+                if comm:
+                    label = "%s（%s）" % (comm, name)
                 lines.append("· %s %s｜%s %s%s %s"
                              % (max(x["成交日"] for x in v)[2:].replace("-", "/"),
-                                region, name, n, size, price_range(v)))
+                                region, label, n, size, price_range(v)))
             if len(g) > 10:
                 lines.append("· …另 %d 個建案" % (len(g) - 10))
             lines.append("")
