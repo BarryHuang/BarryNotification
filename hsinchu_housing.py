@@ -126,12 +126,60 @@ def building_of(addr):
     return (m.group(1) if m else addr).replace("新竹縣竹北市", "").replace("新竹市", "")
 
 
-def unit_price(r):
+def _num(x):
     try:
-        v = float(r.get("單價元平方公尺") or 0)
-    except ValueError:
-        return None
+        return float(x or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def unit_price(r):
+    """每坪單價（萬元），直接採用檔案的「單價元平方公尺」。
+
+    已知限制：車位有面積卻沒獨立計價時（約佔兩成），檔案是用含車位的面積去
+    除總價，單價會低估約兩成。
+
+    試過自己算並用同區車位每坪中位推估車位價，但沒有採用，原因有兩個：
+      一是會偏離官方與各房產網站共同的報價基準（實測光埔中位 54.5 → 59.0），
+        對照外部資料時會互相矛盾；
+      二是本檔的「坪數」欄位是含車位的權狀坪數，單價若改成扣車位，
+        坪數 × 單價 就不等於總價，報表會自我矛盾。
+    真正造成通知失真的是分件登記那類離群值，那個由 drop_outliers() 處理。
+    """
+    v = _num(r.get("單價元平方公尺"))
     return round(v * PING / 10000, 1) if v > 0 else None
+
+
+# 備註標示這些情形時，單價的基準不可信或不是市場價，直接不收：
+#   親友／特殊關係 — 非常規交易，實測中位只有市場價的六成
+#   夾層          — 夾層面積沒登記，單價被高估
+NON_MARKET = ("親友", "特殊關係", "夾層")
+
+# 單價偏離同區中位這個倍數以上就不收。土地及建物分件登記、預售屋權利轉售的
+# 總價與面積基準對不上，單價會變成行情的兩倍以上（實測埔頂一路 120~125 萬/坪
+# vs 光埔中位 47 萬）。用區域相對離群值擋，比猜備註文字可靠；實測只剔除 1.8%。
+OUTLIER_HI = float(os.environ.get("OUTLIER_HI", "1.8"))
+OUTLIER_LO = float(os.environ.get("OUTLIER_LO", "0.5"))
+
+
+def drop_outliers(rows):
+    """剔除單價明顯偏離同區中位的筆數，回傳 (保留, 剔除)。"""
+    base = {}
+    for region in REGIONS:
+        ups = [d["單價萬每坪"] for d in rows
+               if d["區域"] == region and d["單價萬每坪"]
+               and any(t in d["型態"] for t in RESIDENTIAL)]
+        if len(ups) >= 20:
+            base[region] = statistics.median(ups)
+    keep, dropped = [], []
+    for d in rows:
+        m = base.get(d["區域"])
+        u = d["單價萬每坪"]
+        if m and u and not (m * OUTLIER_LO <= u <= m * OUTLIER_HI):
+            dropped.append(d)
+        else:
+            keep.append(d)
+    return keep, dropped
 
 
 def addr_range(names):
@@ -176,6 +224,7 @@ def batches_of(code, kind, seasons, extra):
 
 def collect_resale(seasons, extra=None):
     out, skipped = [], 0
+    communities = load_communities()
     codes = {cfg["code"] for cfg in REGIONS.values()}
     for code in sorted(codes):
         for s, rows in batches_of(code, "A", seasons, extra):
@@ -201,21 +250,33 @@ def collect_resale(seasons, extra=None):
                 if age is None:
                     skipped += 1
                     continue
-                if age > cfg["max_age"]:
+                # 預售屋完工後交屋的登錄，交易日是當初簽約日，屋齡會是負的。
+                # 那是新成屋，不該被屋齡上限擋掉，但負數也不能當屋齡顯示。
+                if max(age, 0.0) > cfg["max_age"]:
+                    continue
+                if any(k in (r.get("備註") or "") for k in NON_MARKET):
+                    continue
+                up = unit_price(r)
+                if up is None:
                     continue
                 out.append({
                     "區域": region, "季別": s, "成交日": deal, "路段": road,
                     "編號": (r.get("編號") or "").strip(),
                     "社區棟別": building_of(addr), "門牌": addr,
+                    "社區": community_of(addr, communities) or "",
                     "型態": r.get("建物型態", ""), "交易標的": r.get("交易標的", ""),
                     "樓層": "%s/%s" % (r.get("移轉層次", ""), r.get("總樓層數", "")),
                     "格局": "%s房%s廳%s衛" % (r.get("建物現況格局-房", ""), r.get("建物現況格局-廳", ""), r.get("建物現況格局-衛", "")),
                     "坪數": round(float(r.get("建物移轉總面積平方公尺") or 0) / PING, 1),
-                    "總價萬": round(total / 10000), "單價萬每坪": unit_price(r) or "",
-                    "屋齡": age, "完工年月": built, "車位": r.get("車位類別", ""),
+                    "總價萬": round(total / 10000), "單價萬每坪": up,
+                    "屋齡": max(age, 0.0), "預售": age < 0, "完工年月": built, "車位": r.get("車位類別", ""),
                     "備註": (r.get("備註") or "")[:60],
                 })
     out = dedupe(out)
+    out, dropped = drop_outliers(out)
+    if dropped:
+        print("  剔除單價偏離同區中位 %.1f~%.1f 倍的 %d 筆"
+              % (OUTLIER_LO, OUTLIER_HI, len(dropped)))
     out.sort(key=lambda x: (x["區域"], x["成交日"] or ""), reverse=False)
     return out, skipped
 
@@ -249,7 +310,8 @@ def collect_presale(seasons, extra=None):
                     "棟及號": r.get("棟及號", ""), "門牌": addr,
                     "樓層": "%s/%s" % (r.get("移轉層次", ""), r.get("總樓層數", "")),
                     "坪數": round(float(r.get("建物移轉總面積平方公尺") or 0) / PING, 1),
-                    "總價萬": round(total / 10000), "單價萬每坪": unit_price(r) or "",
+                    "總價萬": round(total / 10000),
+                    "單價萬每坪": unit_price(r) or "",
                 })
     out = dedupe(out)
     out.sort(key=lambda x: (x["區域"], x["成交日"] or ""))
@@ -278,6 +340,7 @@ OUT_DIR = os.path.join(HERE, "docs")
 DATA_DIR = os.path.join(OUT_DIR, "data")
 STATE_PATH = os.path.join(DATA_DIR, "seen.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "history.json")
+COMMUNITY_PATH = os.path.join(DATA_DIR, "communities.json")
 SOURCE_PATH = os.path.join(DATA_DIR, "source.json")   # 記住上次抓成功的本期端點
 HISTORY_DAYS = int(os.environ.get("HISTORY_DAYS", "60"))
 # 實價登錄申報後約 30 天才揭露，最新成交日正常落後 10~40 天；超過這個天數視為來源停更
@@ -644,6 +707,31 @@ _ctx.check_hostname = False
 _ctx.verify_mode = ssl.CERT_NONE
 
 
+def load_communities():
+    """門牌前綴 → 社區名。實價登錄查不到社區名，這是人工對照表。
+
+    成屋檔沒有建案名稱欄位；預售檔有名稱，但八成的門牌只有路名沒有號，
+    所以兩邊 join 不起來（實測 13 個門牌 0 命中）。只能人工累積。
+    信心欄位不是裝飾：留空的名稱代表還沒確認，不會顯示。
+    """
+    try:
+        with open(COMMUNITY_PATH, encoding="utf-8") as f:
+            raw = json.load(f).get("對照", {})
+    except Exception:
+        return []
+    out = [(k, v.get("名稱", "").strip()) for k, v in raw.items()
+           if isinstance(v, dict) and v.get("名稱", "").strip()]
+    # 由長到短比對，較精確的門牌優先
+    return sorted(out, key=lambda kv: -len(kv[0]))
+
+
+def community_of(addr, table):
+    for prefix, name in table:
+        if prefix in addr:
+            return name
+    return None
+
+
 def load_seen():
     try:
         with open(STATE_PATH, encoding="utf-8") as f:
@@ -782,9 +870,14 @@ def build_message(new_resale, new_presale, resale, baseline=False, fresh=(None, 
                 size = ("%.0f–%.0f坪" % (sizes[0], sizes[-1])) if len(sizes) > 1 else (
                     ("%.0f坪" % sizes[0]) if sizes else "")
                 n = ("×%d筆 " % len(v)) if len(v) > 1 else ""
+                # 有人工對照到社區名就以社區名為主，門牌放括號裡
+                label = name
+                comm = next((x["社區"] for x in v if x.get("社區")), "")
+                if comm:
+                    label = "%s（%s）" % (comm, name)
                 lines.append("· %s %s｜%s %s%s %s"
                              % (max(x["成交日"] for x in v)[2:].replace("-", "/"),
-                                region, name, n, size, price_range(v)))
+                                region, label, n, size, price_range(v)))
             if len(g) > 10:
                 lines.append("· …另 %d 個建案" % (len(g) - 10))
             lines.append("")
@@ -847,16 +940,22 @@ def _current_via_csv():
     for code in _codes():
         for kind in ("A", "B"):
             url = CURRENT_CSV.format(code=code, kind=kind)
-            st, ctype, data = _get(url)
-            if st is None:
-                print("  · 本期 %s_%s 連不上: %s" % (code, kind, ctype))
-                continue
-            if not _looks_like_data(ctype, data):
-                print("  · 本期 %s_%s 回 %s %s %d bytes，不是資料檔"
-                      % (code, kind, st, ctype, len(data)))
-                continue
-            rows = parse_lvr_csv(data)
-            if rows and any(r.get("交易年月日") for r in rows):
+            rows = None
+            # 官網偶發 connection reset，重試兩次再放棄
+            for attempt in (1, 2, 3):
+                st, ctype, data = _get(url)
+                if st is None:
+                    print("  · 本期 %s_%s 第%d次連不上: %s" % (code, kind, attempt, ctype))
+                    continue
+                if not _looks_like_data(ctype, data):
+                    print("  · 本期 %s_%s 回 %s %s %d bytes，不是資料檔"
+                          % (code, kind, st, ctype, len(data)))
+                    break
+                got = parse_lvr_csv(data)
+                if got and any(r.get("交易年月日") for r in got):
+                    rows = got
+                break
+            if rows:
                 out[(code, kind)] = rows
     return out
 
@@ -914,8 +1013,16 @@ def fetch_current():
     """回傳本期資料 {(縣市代號, 檔別): 原始列}；兩種取法都失敗時回 {}。"""
     remembered = load_source()
     modes = sorted(CURRENT_MODES, key=lambda m: m[0] != remembered)
+    want = {(c, k) for c in _codes() for k in ("A", "B")}
     for name, fn in modes:
         got = fn()
+        # 部分成功不算成功：少一個縣市檔就會整批新成交漏掉，寧可換另一種取法
+        if got and set(got) != want:
+            print("  · 本期（%s）只拿到 %d/%d 個檔，缺 %s"
+                  % (name, len(got), len(want),
+                     "、".join("%s_%s" % k for k in sorted(want - set(got)))))
+            if name != modes[-1][0]:
+                continue
         if not got:
             continue
         n = sum(len(v) for v in got.values())
@@ -1076,7 +1183,9 @@ def main():
 
     seen = load_seen()
     baseline = first_run or not seen
-    new_resale = [d for d in resale if d["編號"] and d["編號"] not in seen]
+    # 中位數只採計住宅型態，新成交清單原本沒跟著做，透天厝與「其他」會跑進來
+    new_resale = [d for d in resale if d["編號"] and d["編號"] not in seen
+                  and any(t in d["型態"] for t in RESIDENTIAL)]
     new_presale = [d for d in presale if d["編號"] and d["編號"] not in seen]
     new_resale.sort(key=lambda d: d["成交日"] or "", reverse=True)
     new_presale.sort(key=lambda d: d["成交日"] or "", reverse=True)
